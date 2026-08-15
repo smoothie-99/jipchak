@@ -1,0 +1,58 @@
+# =====================================================================
+# Spring Boot 설정. 환경별 오버라이드 가능한 값은 모두 ${ENV_NAME:기본값}
+# 형태로 외부화한다. .env 또는 docker-compose 환경변수에서 주입.
+# =====================================================================
+
+server:
+  # 컨테이너 외부 노출 포트와는 별개 (nginx upstream 대상 포트).
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: ${SPRING_APPLICATION_NAME:server}
+
+  datasource:
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT:3306}/${DB_NAME:jipchak_db}?serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    database-platform: org.hibernate.dialect.MySQLDialect
+    hibernate:
+      # 운영에서는 validate 또는 none 권장 (env 로 오버라이드).
+      ddl-auto: ${JPA_DDL_AUTO:update}
+    # SQL 로깅: 개발 편의용. 운영에서는 false 로 끄는 것을 권장.
+    show-sql: ${JPA_SHOW_SQL:true}
+    properties:
+      hibernate:
+        format_sql: ${JPA_FORMAT_SQL:true}
+        use_sql_comments: ${JPA_USE_SQL_COMMENTS:true}
+
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+
+  # 멀티파트(영상 파일) 업로드 한도.
+  # Spring Boot 기본값(1MB) 그대로면 게임 영상 업로드 즉시 실패하므로 반드시 조정.
+  # 너무 크게 잡으면 디스크/메모리 부담이 커지니 한 판 영상 크기에 맞춰 결정.
+  servlet:
+    multipart:
+      max-file-size: ${MULTIPART_MAX_FILE_SIZE:50MB}
+      max-request-size: ${MULTIPART_MAX_REQUEST_SIZE:50MB}
+
+# =====================================================================
+# 집착 자체 설정
+# =====================================================================
+jipchak:
+  video:
+    # 디스크에 보관할 최대 영상 개수. 초과 시 가장 오래된 것부터 자동 삭제.
+    max-count: ${JIPCHAK_VIDEO_MAX_COUNT:50}
+    # 영상 저장 베이스 디렉토리 (기본: ai/data/recordings).
+    base-dir: ${JIPCHAK_VIDEO_BASE_DIR:../ai/data/recordings}
+  cors:
+    # 허용 Origin 패턴 (콤마 구분). 운영에서는 반드시 도메인만 명시할 것.
+    # 와일드카드 "*" 는 사용 금지. allowedOriginPatterns 문법을 따른다.
+    # 예: https://k14d108.p.ssafy.io,https://*.ssafy.io,http://localhost:*
+    allowed-origins: ${JIPCHAK_CORS_ALLOWED_ORIGINS:https://k14d108.p.ssafy.io,http://localhost:*,http://127.0.0.1:*}

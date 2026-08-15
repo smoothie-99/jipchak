@@ -1,0 +1,11 @@
+# WebSocket and data serialization
+websockets==12.0
+msgpack==1.0.7
+lz4==4.3.3
+
+# Image processing and Camera SDK
+opencv-python-headless==4.9.0.80
+openni==2.3.0
+
+# Environment variables
+python-dotenv==1.0.1

@@ -1,0 +1,126 @@
+services:
+  # 1. Database (MySQL)
+  db-jipchak:
+    image: mysql:8.0
+    container_name: db-jipchak
+    restart: on-failure
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: jipchak_db
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+    env_file:
+      - .env
+    # 호스트 외부에서의 직접 접근 차단. localhost 와 호스트 내부 디버깅만 허용.
+    # 외부 트래픽은 모두 nginx 를 통해서만 들어오게 한다.
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # 2. Redis
+  redis-jipchak:
+    image: redis:latest
+    container_name: redis-jipchak
+    restart: on-failure
+
+  # 3. Jenkins (CI/CD 도구)
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: jenkins
+    user: root
+    ports:
+      - "${JENKINS_PORT}:8080"
+      - "${JENKINS_AGENT_PORT}:50000"
+    env_file:
+      - .env
+    environment:
+      - JAVA_OPTS=-Xmx512m -Xms256m
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    volumes:
+      - ./jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins
+
+  # 4. Nginx (Reverse Proxy)
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    restart: on-failure
+    ports:
+      - "${NGINX_HTTP_PORT}:80"
+      - "${NGINX_HTTPS_PORT}:443"
+    env_file:
+      - .env
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - app-jipchak
+
+  # 5. Spring Boot
+  app-jipchak:
+    build:
+      context: ../backend
+      dockerfile: ../infra/Dockerfile
+    container_name: app-jipchak
+    restart: on-failure
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      # Spring 의 영상 저장 base dir. 컨테이너 user(uid 1000) 는 /app 에 write 못 함 →
+      # 마운트된 /data/videos 를 명시적으로 가리키도록 환경변수로 주입.
+      - JIPCHAK_VIDEO_BASE_DIR=/data/recordings
+      # JVM default timezone — EC2 가 UTC 라 파일명 timestamp 가 UTC 로 찍히던 문제.
+      # 코드는 명시적 KST 사용하지만 다른 곳에서 default 쓰는 케이스 대비.
+      - TZ=Asia/Seoul
+    # 호스트 외부 노출 차단. nginx 가 docker network 로 직접 호출하므로 영향 없음.
+    ports:
+      - "127.0.0.1:${BACKEND_PORT}:8080" # Spring Boot 내부 기본 포트 8080을 호스트 8108로 매핑
+    env_file:
+      - .env
+    # 영상 영속화 (JIPCHAK_VIDEO_BASE_DIR 와 매핑된 /data/videos 경로, QR 다운로드용)
+    volumes:
+      - ${HOST_VIDEO_DIR}:/data/recordings
+    depends_on:
+      db-jipchak:
+        condition: service_healthy
+      redis-jipchak:
+        condition: service_started
+
+  # [REMOVED] 6. AI Server (ai-jipchak)
+  #   AI 추론 서버는 RunPod (RTX 4000 Ada GPU) 으로 분리됨.
+  #   브라우저 / RPi 모두 wss://<pod-id>.proxy.runpod.net 으로 직접 연결.
+  #   - Frontend: VITE_WS_STREAM_PATH 환경변수로 RunPod URL 주입
+  #   - RPi:      rpi_full.py 의 --url 인자에 RunPod URL
+  #   EC2 의 nginx /ws/ proxy 도 더 이상 사용되지 않음 (브라우저가 직접 RunPod).
+
+  # 7. Frontend (React)
+  frontend-jipchak:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        # Vite 빌드 시점에 번들에 박히는 변수들 (런타임 주입 불가)
+        VITE_ADMIN_PASSWORD: ${VITE_ADMIN_PASSWORD}
+        # WS stream endpoint — RunPod 등 외부 AI 서버 가리킬 때 절대 URL 로 (예: wss://xxx-8000.proxy.runpod.net/ws/stream).
+        # 미설정 시 default '/ws/stream' (nginx proxy 경유).
+        VITE_WS_STREAM_PATH: ${VITE_WS_STREAM_PATH:-/ws/stream}
+    container_name: frontend-jipchak
+    restart: on-failure
+    # 호스트 외부 노출 차단. nginx 가 docker network 로 직접 호출.
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT}:80"
+    env_file:
+      - .env

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+
+# 런타임 산출물
+/data/
+*.mp4

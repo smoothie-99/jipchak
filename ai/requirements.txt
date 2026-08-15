@@ -1,0 +1,31 @@
+# FastAPI / ASGI
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# WebSocket / serialization
+websockets==12.0
+msgpack==1.0.7
+lz4==4.3.3
+
+# Image processing
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# Grasp inference (GR-ConvNet + SSDLite detector + YOLOv8-seg)
+torch==2.4.1
+torchvision==0.19.1
+Pillow==10.4.0
+PyYAML==6.0.2
+scipy==1.14.1
+scikit-image==0.24.0
+ultralytics>=8.4.0
+
+# HTTP client (Spring Boot 호출용)
+httpx==0.27.2
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
