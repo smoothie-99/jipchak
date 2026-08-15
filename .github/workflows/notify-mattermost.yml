@@ -1,0 +1,252 @@
+name: Notify Mattermost
+
+on:
+  pull_request:
+    types: [opened, closed]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, closed]
+  issue_comment:
+    types: [created]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Mattermost notification
+        env:
+          WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          ACTION="${{ github.event.action }}"
+
+          # GitHub ID → 한국이름(@mmID) 매핑. 외부 기여자는 API로 프로필/이메일 조회
+          get_display_name() {
+            local github_id="$1"
+            case "$github_id" in
+              "ChaeMok") echo "이채목(@lcm9211)"; return ;;
+              "KSY") echo "김상연(@iscss123)"; return ;;
+              "1421176") echo "진현제(@mkhggh)"; return ;;
+              "qhrudlim") echo "임보경(@l-elizabeth99)"; return ;;
+              "smoothie-99") echo "강한솔(@kanghansol9266)"; return ;;
+            esac
+
+            # 외부 기여자 → GitHub API로 프로필 조회
+            USER_INFO=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+              "https://api.github.com/users/${github_id}")
+            NAME=$(echo "$USER_INFO" | jq -r '.name // empty')
+            EMAIL=$(echo "$USER_INFO" | jq -r '.email // empty')
+
+            DETAIL=""
+            [ -n "$NAME" ] && DETAIL="$NAME"
+            if [ -n "$EMAIL" ]; then
+              [ -n "$DETAIL" ] && DETAIL="${DETAIL}, ${EMAIL}" || DETAIL="$EMAIL"
+            fi
+            [ -z "$DETAIL" ] && DETAIL="외부 기여자"
+
+            echo ":earth_asia: [${github_id}](https://github.com/${github_id}) (${DETAIL})"
+          }
+
+          SKIP=false
+          EMOJI=""
+          STATUS=""
+          TITLE=""
+          URL=""
+          NUMBER=""
+          TABLE=""
+          EXCERPT=""
+
+          case "$EVENT_NAME" in
+            "pull_request")
+              TITLE="${{ github.event.pull_request.title }}"
+              URL="${{ github.event.pull_request.html_url }}"
+              NUMBER="${{ github.event.pull_request.number }}"
+              PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+              MERGED_BY="${{ github.event.pull_request.merged_by.login }}"
+              MERGED="${{ github.event.pull_request.merged }}"
+              SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}"
+              TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
+
+              AUTHOR_DISP=$(get_display_name "$PR_AUTHOR")
+
+              if [ "$ACTION" = "opened" ]; then
+                EMOJI=":arrow_right:"
+                STATUS="새 PR이 올라왔습니다"
+                TABLE="| 항목 | 내용 |
+          |---|---|
+          | 작성자 | ${AUTHOR_DISP} |
+          | 브랜치 | \`${SOURCE_BRANCH}\` → \`${TARGET_BRANCH}\` |"
+              elif [ "$ACTION" = "closed" ] && [ "$MERGED" = "true" ]; then
+                MERGER_DISP=$(get_display_name "$MERGED_BY")
+                EMOJI=":white_check_mark:"
+                STATUS="PR이 머지되었습니다"
+                TABLE="| 항목 | 내용 |
+          |---|---|
+          | 작성자 | ${AUTHOR_DISP} |
+          | 머지한 사람 | ${MERGER_DISP} |
+          | 브랜치 | \`${SOURCE_BRANCH}\` → \`${TARGET_BRANCH}\` |"
+              elif [ "$ACTION" = "closed" ]; then
+                EMOJI=":x:"
+                STATUS="PR이 닫혔습니다"
+                TABLE="| 항목 | 내용 |
+          |---|---|
+          | 작성자 | ${AUTHOR_DISP} |
+          | 브랜치 | \`${SOURCE_BRANCH}\` → \`${TARGET_BRANCH}\` |"
+              else
+                SKIP=true
+              fi
+              ;;
+
+            "pull_request_review")
+              REVIEW_STATE="${{ github.event.review.state }}"
+              REVIEWER="${{ github.event.review.user.login }}"
+              TITLE="${{ github.event.pull_request.title }}"
+              URL="${{ github.event.review.html_url }}"
+              NUMBER="${{ github.event.pull_request.number }}"
+              PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+              REVIEW_BODY=$(cat <<'BODY_EOF'
+          ${{ github.event.review.body }}
+          BODY_EOF
+          )
+
+              AUTHOR_DISP=$(get_display_name "$PR_AUTHOR")
+              REVIEWER_DISP=$(get_display_name "$REVIEWER")
+
+              case "$REVIEW_STATE" in
+                "approved")
+                  EMOJI=":thumbsup:"
+                  STATUS="PR이 승인되었습니다"
+                  ;;
+                "changes_requested")
+                  EMOJI=":warning:"
+                  STATUS="PR에 변경 요청이 있습니다"
+                  ;;
+                "commented")
+                  EMOJI=":speech_balloon:"
+                  STATUS="PR에 리뷰 코멘트가 달렸습니다"
+                  ;;
+                *)
+                  SKIP=true
+                  ;;
+              esac
+
+              TABLE="| 항목 | 내용 |
+          |---|---|
+          | 리뷰어 | ${REVIEWER_DISP} |
+          | 작성자 | ${AUTHOR_DISP} |"
+              if [ -n "$REVIEW_BODY" ] && [ "$REVIEW_BODY" != "null" ]; then
+                EXCERPT="> ${REVIEW_BODY}"
+              fi
+              ;;
+
+            "pull_request_review_comment")
+              COMMENTER="${{ github.event.comment.user.login }}"
+              TITLE="${{ github.event.pull_request.title }}"
+              URL="${{ github.event.comment.html_url }}"
+              NUMBER="${{ github.event.pull_request.number }}"
+              PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+              FILE_PATH="${{ github.event.comment.path }}"
+              COMMENT_BODY=$(cat <<'BODY_EOF'
+          ${{ github.event.comment.body }}
+          BODY_EOF
+          )
+
+              AUTHOR_DISP=$(get_display_name "$PR_AUTHOR")
+              COMMENTER_DISP=$(get_display_name "$COMMENTER")
+
+              EMOJI=":memo:"
+              STATUS="PR 코드에 인라인 코멘트가 달렸습니다"
+              TABLE="| 항목 | 내용 |
+          |---|---|
+          | 코멘트 작성자 | ${COMMENTER_DISP} |
+          | PR 작성자 | ${AUTHOR_DISP} |
+          | 파일 | \`${FILE_PATH}\` |"
+              EXCERPT="> ${COMMENT_BODY}"
+              ;;
+
+            "issues")
+              TITLE="${{ github.event.issue.title }}"
+              URL="${{ github.event.issue.html_url }}"
+              NUMBER="${{ github.event.issue.number }}"
+              ISSUE_AUTHOR="${{ github.event.issue.user.login }}"
+
+              AUTHOR_DISP=$(get_display_name "$ISSUE_AUTHOR")
+
+              if [ "$ACTION" = "opened" ]; then
+                EMOJI=":beetle:"
+                STATUS="새 이슈가 등록되었습니다"
+              elif [ "$ACTION" = "closed" ]; then
+                EMOJI=":ballot_box_with_check:"
+                STATUS="이슈가 종료되었습니다"
+              else
+                SKIP=true
+              fi
+
+              TABLE="| 항목 | 내용 |
+          |---|---|
+          | 작성자 | ${AUTHOR_DISP} |"
+              ;;
+
+            "issue_comment")
+              IS_PR="${{ github.event.issue.pull_request.url }}"
+              COMMENTER="${{ github.event.comment.user.login }}"
+              TITLE="${{ github.event.issue.title }}"
+              URL="${{ github.event.comment.html_url }}"
+              NUMBER="${{ github.event.issue.number }}"
+              ORIG_AUTHOR="${{ github.event.issue.user.login }}"
+              COMMENT_BODY=$(cat <<'BODY_EOF'
+          ${{ github.event.comment.body }}
+          BODY_EOF
+          )
+
+              AUTHOR_DISP=$(get_display_name "$ORIG_AUTHOR")
+              COMMENTER_DISP=$(get_display_name "$COMMENTER")
+
+              EMOJI=":speech_balloon:"
+              if [ -n "$IS_PR" ]; then
+                STATUS="PR에 댓글이 달렸습니다"
+                LABEL="PR 작성자"
+              else
+                STATUS="이슈에 댓글이 달렸습니다"
+                LABEL="이슈 작성자"
+              fi
+              TABLE="| 항목 | 내용 |
+          |---|---|
+          | 댓글 작성자 | ${COMMENTER_DISP} |
+          | ${LABEL} | ${AUTHOR_DISP} |"
+              EXCERPT="> ${COMMENT_BODY}"
+              ;;
+
+            *)
+              SKIP=true
+              ;;
+          esac
+
+          if [ "$SKIP" = "true" ]; then
+            echo "Skipping notification for event: $EVENT_NAME / $ACTION"
+            exit 0
+          fi
+
+          # 메시지 조립
+          MSG="### ${EMOJI} ${STATUS}
+          **[#${NUMBER} ${TITLE}](${URL})**
+          ${TABLE}"
+
+          if [ -n "$EXCERPT" ]; then
+            MSG="${MSG}
+          ${EXCERPT}"
+          fi
+
+          PAYLOAD=$(jq -n --arg text "$MSG" '{text: $text}')
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WEBHOOK_URL"
+
+          echo "Mattermost notification sent"

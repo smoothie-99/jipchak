@@ -1,0 +1,70 @@
+name: Sync to GitLab
+
+on:
+  push:
+    branches: '**'
+  workflow_dispatch:
+
+jobs:
+  push-to-gitlab:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: |
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Set remote repository
+        env:
+          gitlab_url: ${{ secrets.LABSSAFY_URL }}
+          gitlab_token_name: ${{ secrets.LABSSAFY_TOKEN_NAME }}
+          gitlab_token: ${{ secrets.LABSSAFY_TOKEN }}
+        run: |
+          git remote add gitlab https://${gitlab_token_name}:${gitlab_token}@${gitlab_url#https://};
+
+      - name: Force push everything
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_BRANCH="${GITHUB_REF#refs/heads/}"
+          CURRENT_SHA="${{ github.sha }}"
+          SKIP_BRANCHES=""
+
+          # 현재 push가 PR merge 결과인지 확인
+          if [ "${{ github.event_name }}" = "push" ]; then
+            MERGED_PR=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls?state=closed&base=${CURRENT_BRANCH}&per_page=5" \
+              | jq -r --arg sha "$CURRENT_SHA" '.[] | select(.merge_commit_sha == $sha) | .number')
+
+            if [ -n "$MERGED_PR" ]; then
+              echo "PR #${MERGED_PR} merge detected on ${CURRENT_BRANCH}, skipping (GitLab MR handles it)"
+              SKIP_BRANCHES="$SKIP_BRANCHES $CURRENT_BRANCH"
+            fi
+          fi
+
+          for branch in $(git branch -r | grep 'origin/' | grep -v 'HEAD' | sed 's|origin/||'); do
+            # main은 master로 매핑되므로 루프에서 제외
+            if [ "$branch" = "main" ]; then
+              echo "Skipping main (mapped to master separately)"
+              continue
+            fi
+            SKIP=false
+            for skip in $SKIP_BRANCHES; do
+              if [ "$branch" = "$skip" ]; then
+                SKIP=true
+                break
+              fi
+            done
+            if [ "$SKIP" = "true" ]; then
+              echo "Skipping $branch (updated via GitLab MR)"
+              continue
+            fi
+            echo "Pushing $branch..."
+            git push -f gitlab "refs/remotes/origin/${branch}:refs/heads/${branch}"
+          done
+          git push -f --tags gitlab;
+          git push -f gitlab refs/remotes/origin/main:refs/heads/master || true;

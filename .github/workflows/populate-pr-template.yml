@@ -1,0 +1,146 @@
+name: Auto-populate PR template with AI
+
+on:
+  pull_request:
+    types: [opened]
+
+jobs:
+  populate:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Analyze commits and fill PR body via Gemini
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # 이미 템플릿이 채워져 있으면 skip
+          CURRENT_BODY=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')
+          if echo "$CURRENT_BODY" | grep -q "## Summary / 요약"; then
+            echo "Template already filled, skipping"
+            exit 0
+          fi
+
+          # PR의 커밋 메시지 추출
+          COMMITS=$(git log --pretty=format:"- %s" "${BASE_SHA}..${HEAD_SHA}")
+
+          # 변경 파일 목록 (최대 50개)
+          CHANGED_FILES=$(git diff --name-only "${BASE_SHA}..${HEAD_SHA}" | head -50)
+
+          # diff 요약 (최대 3000줄, 너무 크면 잘라냄)
+          DIFF=$(git diff "${BASE_SHA}..${HEAD_SHA}" | head -3000)
+
+          # Gemini에 보낼 프롬프트
+          PROMPT=$(cat <<PROMPT_EOF
+          You are helping fill a GitHub Pull Request description based on commits and code changes.
+          Analyze the following commits and changes, then output ONLY the markdown body in the exact template format below.
+          Write content in Korean (한글). Keep it concise and accurate based on actual changes.
+
+          ## Commits:
+          ${COMMITS}
+
+          ## Changed files:
+          ${CHANGED_FILES}
+
+          ## Diff (truncated):
+          ${DIFF}
+
+          ---
+
+          Output format (fill each section based on the commits/diff, write in Korean):
+
+          ## Summary / 요약
+          [1-2 sentences summarizing the main purpose]
+
+          ## Changes / 변경사항
+          - [bullet point for each meaningful change]
+          - [group related commits into coherent items]
+
+          ## Test / 테스트
+          - [ ] [specific testable items based on the changes]
+          - [ ] [another test case]
+
+          ## Related Issues / 관련 이슈
+          - 없음
+
+          Output the markdown only, no other text, no code fences.
+          PROMPT_EOF
+          )
+
+          # JSON payload 생성
+          PAYLOAD=$(jq -n --arg text "$PROMPT" '{
+            contents: [{
+              parts: [{ text: $text }]
+            }]
+          }')
+
+          # Gemini API 호출
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "=== Gemini API HTTP status: ${HTTP_CODE} ==="
+          echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
+          echo "=== end of raw response ==="
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::warning::Gemini API returned HTTP ${HTTP_CODE}"
+          fi
+
+          # 응답에서 텍스트 추출
+          AI_BODY=$(echo "$RESPONSE_BODY" | jq -r '.candidates[0].content.parts[0].text // ""')
+
+          # 코드 펜스로 감싸진 경우 제거
+          AI_BODY=$(echo "$AI_BODY" | sed -E 's/^```(markdown|md)?$//; s/^```$//' | sed '/^$/N;/\n$/d')
+
+          if [ -z "$AI_BODY" ] || [ "$AI_BODY" = "null" ]; then
+            echo "::warning::Failed to get AI response, falling back to template only"
+            AI_BODY=$(cat .github/PULL_REQUEST_TEMPLATE.md)
+          else
+            echo "=== AI generated body ==="
+            echo "$AI_BODY"
+            echo "=== end of AI body ==="
+          fi
+
+          # 기존 본문(보통 커밋 메시지)을 참고용으로 아래에 붙임
+          if [ -n "$CURRENT_BODY" ]; then
+            NEW_BODY="${AI_BODY}
+
+          ---
+
+          <details>
+          <summary>🤖 AI가 커밋/diff를 분석해 자동 작성한 내용입니다. 필요 시 수정하세요.</summary>
+
+          Original commit message:
+
+          ${CURRENT_BODY}
+
+          </details>"
+          else
+            NEW_BODY="${AI_BODY}
+
+          ---
+
+          > 🤖 AI가 커밋/diff를 분석해 자동 작성한 내용입니다. 필요 시 수정하세요."
+          fi
+
+          echo "$NEW_BODY" > /tmp/pr_body.md
+          gh api --method PATCH "repos/${REPO}/pulls/${PR_NUMBER}" \
+            -F body=@/tmp/pr_body.md
+
+          echo "PR body updated with AI-generated content"

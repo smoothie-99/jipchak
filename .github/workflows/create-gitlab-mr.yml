@@ -1,0 +1,159 @@
+name: Create GitLab MR on PR merge
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  create-gitlab-mr:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: |
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Wait for sync to complete
+        run: sleep 15
+
+      - name: Create and merge MR on GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.LABSSAFY_TOKEN }}
+          GITLAB_PROJECT_ID: ${{ secrets.LABSSAFY_PROJECT_ID }}
+          GITLAB_URL: ${{ secrets.LABSSAFY_URL }}
+          LABSSAFY_TOKEN_NAME: ${{ secrets.LABSSAFY_TOKEN_NAME }}
+        run: |
+          # GitHub PR 정보 추출
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_BODY=$(cat <<'BODY_EOF'
+          ${{ github.event.pull_request.body }}
+          BODY_EOF
+          )
+          SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}"
+          TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+
+          # GitHub main → GitLab master 매핑
+          GITLAB_TARGET="$TARGET_BRANCH"
+          if [ "$TARGET_BRANCH" = "main" ]; then
+            GITLAB_TARGET="master"
+          fi
+
+          # PR merge한 사람, PR 작성자
+          MERGED_BY="${{ github.event.pull_request.merged_by.login }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+
+          # GitHub ID → 표시용 이름. 외부 기여자는 API로 프로필 조회
+          get_display_name() {
+            local github_id="$1"
+            case "$github_id" in
+              "ChaeMok") echo "${github_id} (이채목)"; return ;;
+              "KSY") echo "${github_id} (김상연)"; return ;;
+              "1421176") echo "${github_id} (진현제)"; return ;;
+              "qhrudlim") echo "${github_id} (임보경)"; return ;;
+              "smoothie-99") echo "${github_id} (강한솔)"; return ;;
+            esac
+
+            USER_INFO=$(curl -s -H "Authorization: token ${{ github.token }}" \
+              "https://api.github.com/users/${github_id}")
+            NAME=$(echo "$USER_INFO" | jq -r '.name // empty')
+            EMAIL=$(echo "$USER_INFO" | jq -r '.email // empty')
+
+            DETAIL=""
+            [ -n "$NAME" ] && DETAIL="$NAME"
+            if [ -n "$EMAIL" ]; then
+              [ -n "$DETAIL" ] && DETAIL="${DETAIL}, ${EMAIL}" || DETAIL="$EMAIL"
+            fi
+            [ -z "$DETAIL" ] && DETAIL="외부 기여자"
+
+            echo "🌍 [${github_id}](https://github.com/${github_id}) (${DETAIL})"
+          }
+
+          MERGED_BY_DISP=$(get_display_name "$MERGED_BY")
+          PR_AUTHOR_DISP=$(get_display_name "$PR_AUTHOR")
+
+          GITLAB_HOST=$(echo "$GITLAB_URL" | sed -E 's|https?://([^/]+).*|\1|')
+
+          # GitLab remote 추가
+          git remote add gitlab "https://${LABSSAFY_TOKEN_NAME}:${GITLAB_TOKEN}@${GITLAB_URL#https://}"
+
+          DESCRIPTION="🔗 GitHub PR: ${PR_URL}
+
+          | 항목 | 내용 |
+          |---|---|
+          | 작성자 | ${PR_AUTHOR_DISP} |
+          | 머지한 사람 | ${MERGED_BY_DISP} |
+
+          ---
+
+          ${PR_BODY}"
+
+          # GitLab MR 생성
+          MR_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --request POST \
+            --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "$(jq -n \
+              --arg title "[#${PR_NUMBER}] ${PR_TITLE}" \
+              --arg desc "$DESCRIPTION" \
+              --arg source "$SOURCE_BRANCH" \
+              --arg target "$GITLAB_TARGET" \
+              '{
+                source_branch: $source,
+                target_branch: $target,
+                title: $title,
+                description: $desc,
+                remove_source_branch: false
+              }'
+            )" \
+            "https://${GITLAB_HOST}/api/v4/projects/${GITLAB_PROJECT_ID}/merge_requests")
+
+          HTTP_CODE=$(echo "$MR_RESPONSE" | tail -1)
+          MR_BODY=$(echo "$MR_RESPONSE" | sed '$d')
+
+          echo "GitLab MR API response (HTTP ${HTTP_CODE}):"
+          echo "$MR_BODY" | jq '.' 2>/dev/null || echo "$MR_BODY"
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::warning::Failed to create GitLab MR (HTTP ${HTTP_CODE})"
+            exit 0
+          fi
+
+          MR_IID=$(echo "$MR_BODY" | jq -r '.iid')
+
+          if [ "$MR_IID" = "null" ] || [ -z "$MR_IID" ]; then
+            echo "::warning::Could not extract MR IID"
+            exit 0
+          fi
+
+          echo "Created GitLab MR !${MR_IID}"
+
+          # MR merge
+          sleep 3
+          MERGE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --request PUT \
+            --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            "https://${GITLAB_HOST}/api/v4/projects/${GITLAB_PROJECT_ID}/merge_requests/${MR_IID}/merge")
+
+          MERGE_HTTP=$(echo "$MERGE_RESPONSE" | tail -1)
+          MERGE_BODY=$(echo "$MERGE_RESPONSE" | sed '$d')
+
+          echo "GitLab Merge response (HTTP ${MERGE_HTTP}):"
+          echo "$MERGE_BODY" | jq '.' 2>/dev/null || echo "$MERGE_BODY"
+
+          if [ "$MERGE_HTTP" -ge 400 ]; then
+            echo "::warning::MR created but auto-merge failed. Manual merge may be needed."
+          else
+            echo "Successfully merged GitLab MR !${MR_IID}"
+          fi
+
+          # MR merge 후 target 브랜치를 GitHub과 동기화 (히스토리 일치)
+          sleep 3
+          echo "Syncing target branch ${GITLAB_TARGET} to match GitHub..."
+          git push -f gitlab "refs/remotes/origin/${TARGET_BRANCH}:refs/heads/${GITLAB_TARGET}" || true

@@ -1,0 +1,32 @@
+name: Delete branch on GitLab
+
+on:
+  delete:
+
+jobs:
+  delete-branch:
+    if: github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete branch on GitLab
+        env:
+          GITLAB_URL: ${{ secrets.LABSSAFY_URL }}
+          GITLAB_TOKEN_NAME: ${{ secrets.LABSSAFY_TOKEN_NAME }}
+          GITLAB_TOKEN: ${{ secrets.LABSSAFY_TOKEN }}
+        run: |
+          BRANCH="${{ github.event.ref }}"
+
+          # 보호 브랜치는 삭제 금지
+          PROTECTED="main master dev frontend backend ai embedded infra"
+          for p in $PROTECTED; do
+            if [ "$BRANCH" = "$p" ]; then
+              echo "Protected branch ${BRANCH}, skipping delete"
+              exit 0
+            fi
+          done
+
+          echo "Deleting branch ${BRANCH} on GitLab..."
+          git init -q tmp && cd tmp
+          git remote add gitlab "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@${GITLAB_URL#https://}"
+          git push gitlab --delete "$BRANCH" || echo "Branch may not exist on GitLab"

@@ -1,0 +1,31 @@
+name: Create branch on GitLab
+
+on:
+  create:
+
+jobs:
+  create-branch:
+    if: github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: |
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Push new branch to GitLab
+        env:
+          GITLAB_URL: ${{ secrets.LABSSAFY_URL }}
+          GITLAB_TOKEN_NAME: ${{ secrets.LABSSAFY_TOKEN_NAME }}
+          GITLAB_TOKEN: ${{ secrets.LABSSAFY_TOKEN }}
+        run: |
+          BRANCH="${{ github.event.ref }}"
+
+          git remote add gitlab "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@${GITLAB_URL#https://}"
+
+          echo "Creating branch ${BRANCH} on GitLab..."
+          git push -f gitlab "refs/remotes/origin/${BRANCH}:refs/heads/${BRANCH}"
