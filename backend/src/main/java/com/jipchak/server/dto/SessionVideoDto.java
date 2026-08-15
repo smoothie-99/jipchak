@@ -14,4 +14,5 @@ public class SessionVideoDto {
     private String url;
     private String thumb;
     private Boolean isSuccess;
+    private Double successProbability;
 }

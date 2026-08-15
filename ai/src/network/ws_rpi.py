@@ -190,6 +190,11 @@ async def _apply_control(
             "session_id": session_id,
             "is_caught": judge.is_caught if judge else False,
             "confidence": judge.confidence if judge else 0.0,
+            "success_probability": (
+                result.get("successProbability")
+                if isinstance(result, dict)
+                else None
+            ),
         }).encode())
         return None
 

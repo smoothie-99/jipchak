@@ -52,5 +52,22 @@ THREE_JAW_MAX_BOX_AREA_RATIO = float(os.getenv("THREE_JAW_MAX_BOX_AREA_RATIO", "
 THREE_JAW_MIN_MASK_FILL_RATIO = float(os.getenv("THREE_JAW_MIN_MASK_FILL_RATIO", "0.35"))
 THREE_JAW_FACE_ONLY_MAX_AREA_RATIO = float(os.getenv("THREE_JAW_FACE_ONLY_MAX_AREA_RATIO", "0.12"))
 
+# 게임 결과 기반 성공 확률 자동 학습
+# 학습 데이터와 모델은 컨테이너 재시작 후에도 남아야 하므로 /data 를 기본 경로로 사용한다.
+SUCCESS_LEARNING_ENABLED = os.getenv("SUCCESS_LEARNING_ENABLED", "true").lower() == "true"
+SUCCESS_LEARNING_DATA_PATH = os.getenv(
+    "SUCCESS_LEARNING_DATA_PATH", "/data/learning/grasp_attempts.jsonl"
+)
+SUCCESS_MODEL_PATH = os.getenv(
+    "SUCCESS_MODEL_PATH", "/data/learning/success_evaluator.pth"
+)
+SUCCESS_LEARNING_MIN_SAMPLES = int(os.getenv("SUCCESS_LEARNING_MIN_SAMPLES", "30"))
+SUCCESS_LEARNING_RETRAIN_EVERY = int(os.getenv("SUCCESS_LEARNING_RETRAIN_EVERY", "10"))
+SUCCESS_LEARNING_MIN_CLASS_SAMPLES = int(
+    os.getenv("SUCCESS_LEARNING_MIN_CLASS_SAMPLES", "5")
+)
+SUCCESS_LEARNING_EPOCHS = int(os.getenv("SUCCESS_LEARNING_EPOCHS", "120"))
+SUCCESS_LEARNING_BATCH_SIZE = int(os.getenv("SUCCESS_LEARNING_BATCH_SIZE", "32"))
+
 # 로그
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

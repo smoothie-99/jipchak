@@ -5,6 +5,8 @@ import numpy as np
 from three_jaw_grasp import GraspPipeline
 from three_jaw_grasp.adapters import YoloSegGraspAdapter
 from three_jaw_grasp.evaluator_chick import ChickEvaluator
+from three_jaw_grasp.success_feature_extractor import SuccessFeatureExtractor
+from src.learning import AutoSuccessLearner
 
 
 class Yolo26sSegWrapper:
@@ -133,13 +135,30 @@ class ThreeJawGraspService:
         max_box_area_ratio: float = 0.60,
         min_mask_fill_ratio: float = 0.35,
         face_only_max_area_ratio: float = 0.12,
+        success_learning_enabled: bool = True,
+        success_learning_data_path: str = "/data/learning/grasp_attempts.jsonl",
+        success_model_path: str = "/data/learning/success_evaluator.pth",
+        success_learning_min_samples: int = 30,
+        success_learning_retrain_every: int = 10,
+        success_learning_min_class_samples: int = 5,
+        success_learning_epochs: int = 120,
+        success_learning_batch_size: int = 32,
     ):
         self._pipeline = None
+        self._learner = None
         self._image_wh = (640, 480)  # D435 기본 해상도
         self._min_box_area_ratio = min_box_area_ratio
         self._max_box_area_ratio = max_box_area_ratio
         self._min_mask_fill_ratio = min_mask_fill_ratio
         self._face_only_max_area_ratio = face_only_max_area_ratio
+        self._success_learning_enabled = success_learning_enabled
+        self._success_learning_data_path = success_learning_data_path
+        self._success_model_path = success_model_path
+        self._success_learning_min_samples = success_learning_min_samples
+        self._success_learning_retrain_every = success_learning_retrain_every
+        self._success_learning_min_class_samples = success_learning_min_class_samples
+        self._success_learning_epochs = success_learning_epochs
+        self._success_learning_batch_size = success_learning_batch_size
 
     def load(self, model_path: str) -> None:
         """
@@ -157,14 +176,38 @@ class ThreeJawGraspService:
             face_only_max_area_ratio=self._face_only_max_area_ratio,
         )
         adapter = YoloSegGraspAdapter()
-        evaluator = ChickEvaluator(jaw_count=3)
+        evaluator = ChickEvaluator(
+            jaw_count=3,
+            extractor=SuccessFeatureExtractor(),
+            model_path=(
+                self._success_model_path
+                if os.path.exists(self._success_model_path)
+                else None
+            ),
+        )
 
         self._pipeline = GraspPipeline(
             model=model, adapter=adapter, evaluator=evaluator
         )
+        self._learner = AutoSuccessLearner(
+            data_path=self._success_learning_data_path,
+            model_path=self._success_model_path,
+            evaluator=evaluator,
+            enabled=self._success_learning_enabled,
+            min_samples=self._success_learning_min_samples,
+            retrain_every=self._success_learning_retrain_every,
+            min_class_samples=self._success_learning_min_class_samples,
+            epochs=self._success_learning_epochs,
+            batch_size=self._success_learning_batch_size,
+        )
         print(f"[ThreeJawGraspService] Pipeline 로드 완료 (YOLO: {model_path})")
 
-    def infer(self, color_bgr: np.ndarray, depth_mm: np.ndarray) -> dict | None:
+    def infer(
+        self,
+        color_bgr: np.ndarray,
+        depth_mm: np.ndarray,
+        session_id: str | None = None,
+    ) -> dict | None:
         if self._pipeline is None:
             print("[ThreeJawGraspService] _pipeline is None (load 실패?)")
             return None
@@ -183,18 +226,12 @@ class ThreeJawGraspService:
                 f"[ThreeJawGraspService] infer start: "
                 f"rgb_shape={color_bgr.shape} depth={'O' if depth_m is not None else 'X'}"
             )
-            best = self._pipeline.predict_best(color_bgr, depth_m)
-
             # 해상도 업데이트 (들어오는 영상 기준)
             if color_bgr is not None:
                 h, w = color_bgr.shape[:2]
                 self._image_wh = (w, h)
             else:
                 w, h = self._image_wh
-
-            # --- ChickEvaluator의 정교한 점수(목 조준 등) 가져오기 ---
-            score_info = self._pipeline.evaluator.score_detail(best, depth_m)
-            total_quality_score = score_info.get("total", best.original_score)
 
             # --- 조준 정확도 점수(Centering Score) 계산 ---
             # 카메라 중심(화면 중앙) 좌표
@@ -210,6 +247,25 @@ class ThreeJawGraspService:
             gripper_x = cam_x - (CAM_LEFT_OFFSET_MM * PX_PER_MM)
             gripper_y = cam_y - (CAM_FORWARD_OFFSET_MM * PX_PER_MM)
 
+            candidates = self._pipeline.predict_candidates(color_bgr, depth_m)
+            for candidate in candidates:
+                candidate_distance = np.sqrt(
+                    (candidate.center_x - gripper_x) ** 2
+                    + (candidate.center_y - gripper_y) ** 2
+                )
+                candidate.raw["gripper_distance_ratio"] = float(
+                    candidate_distance / max(float(candidate.width), 1e-6)
+                )
+                detail = self._pipeline.evaluator.score_detail(candidate, depth_m)
+                for name in ("top_bias", "neck_capture", "support", "clearance"):
+                    candidate.raw[name] = float(
+                        detail.get(name, {}).get("raw", 0.0)
+                    )
+            best = self._pipeline.evaluator.select_best(candidates, depth=depth_m)
+
+            # --- ChickEvaluator의 세부 규칙 점수(로그/설명용) ---
+            score_info = self._pipeline.evaluator.score_detail(best, depth_m)
+
             # 병아리(검출된 목표)와 '실제 집게 중심' 사이의 거리 (정밀도 가중치 계산용)
             dist = np.sqrt(
                 (best.center_x - gripper_x) ** 2 + (best.center_y - gripper_y) ** 2
@@ -223,18 +279,47 @@ class ThreeJawGraspService:
             overlay_y = gripper_y + (best.center_y - gripper_y) * ALPHA
 
             # 인형의 크기(best.width)를 기준으로 거리에 따른 감점 요인 계산 (범위 0.8로 완화)
-            sigma = best.width * 0.8
+            sigma = max(best.width * 0.8, 1e-6)
             centering_weight = np.exp(-(dist**2) / (2 * (sigma**2)))
 
-            # 최종 점수 = 병아리 파지 품질 점수(목 조준 포함) * 조준 가중치
-            final_confidence = float(total_quality_score * centering_weight)
+            # 학습 모델이 있으면 실제 성공/실패 데이터로 보정된 확률을 사용한다.
+            # 데이터 부족 시에만 기존 규칙 점수가 초기값으로 동작한다.
+            grasp_probability = self._pipeline.evaluator.success_probability(
+                best, depth_m
+            )
+            prediction_source = self._pipeline.evaluator.prediction_source
+            # ML 모델은 gripper_distance_ratio를 직접 학습하므로 거리 감점을
+            # 다시 곱하지 않는다. 규칙 기반 초기 단계에서만 centering을 별도 반영한다.
+            final_confidence = float(
+                np.clip(
+                    grasp_probability
+                    if prediction_source == "ml"
+                    else grasp_probability * centering_weight,
+                    0.0,
+                    1.0,
+                )
+            )
+            if self._learner is not None and session_id:
+                self._learner.remember_attempt(
+                    session_id=session_id,
+                    candidate=best,
+                    depth=depth_m,
+                    predicted_probability=final_confidence,
+                    metadata={
+                        "prediction_source": prediction_source,
+                        "rule_score": float(score_info.get("total", 0.0)),
+                        "centering_weight": float(centering_weight),
+                        "doll_type": score_info.get("doll_type", "unknown"),
+                        "yolo_confidence": float(best.original_score),
+                    },
+                )
 
             print(
                 f"[ThreeJawGraspService] candidate: "
                 f"doll=({best.center_x:.0f},{best.center_y:.0f}) gripper=({gripper_x:.0f},{gripper_y:.0f}) "
                 f"width={best.width:.1f} angle={best.angle:.2f} "
-                f"quality={total_quality_score:.3f} centering={centering_weight:.3f} "
-                f"final={final_confidence:.3f}"
+                f"grasp_prob={grasp_probability:.3f} centering={centering_weight:.3f} "
+                f"final={final_confidence:.3f} source={prediction_source}"
             )
 
             # 최종 필터링: 디버깅을 위해 임계값을 0.01로 낮춤
@@ -253,6 +338,7 @@ class ThreeJawGraspService:
                 "radius": float(best.width * 1.5),  # (인형 크기에 맞춰 배율 1.5로 상향)
                 "jaw_count": 3,
                 "confidence": final_confidence,
+                "prediction_source": prediction_source,
                 "image_width": w,
                 "image_height": h,
             }
@@ -263,3 +349,27 @@ class ThreeJawGraspService:
         except Exception as e:
             print(f"[ThreeJawGraspService] infer error: {e}")
             return None
+
+    def record_outcome(self, session_id: str, success: bool) -> bool:
+        """마지막 파지 관측값에 성공/실패 라벨을 붙이고 자동 재학습을 예약한다."""
+        if self._learner is None:
+            return False
+        return self._learner.complete_attempt(session_id, success)
+
+    def discard_attempt(self, session_id: str) -> None:
+        if self._learner is not None:
+            self._learner.discard_attempt(session_id)
+
+    @property
+    def learning_status(self) -> dict:
+        if self._learner is None:
+            return {"enabled": False}
+        stats = self._learner.dataset_stats()
+        return {
+            "enabled": self._learner.enabled,
+            "training": self._learner.training,
+            "samples": stats.total,
+            "success": stats.success,
+            "failure": stats.failure,
+            "prediction_source": self._pipeline.evaluator.prediction_source,
+        }

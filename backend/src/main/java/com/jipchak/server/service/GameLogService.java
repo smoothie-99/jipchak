@@ -50,7 +50,17 @@ public class GameLogService {
     @Value("${jipchak.video.base-dir:videos}")
     private String videoBaseDir;
 
-    public Long saveGameLog(String sessionId, Boolean isSuccess, MultipartFile video) throws IOException {
+    public GameLogResponse saveGameLog(
+            String sessionId,
+            Boolean isSuccess,
+            Double successProbability,
+            MultipartFile video) throws IOException {
+        if (successProbability != null
+                && (!Double.isFinite(successProbability)
+                || successProbability < 0.0
+                || successProbability > 1.0)) {
+            throw new IllegalArgumentException("successProbability는 0.0~1.0 범위여야 합니다.");
+        }
         // 1. 영상 저장 폴더 보장
         String uploadPath = resolveUploadPath();
         File folder = new File(uploadPath);
@@ -72,6 +82,7 @@ public class GameLogService {
         GameLog gameLogEntity = GameLog.builder()
                 .sessionId(sessionId)
                 .isSuccess(isSuccess)
+                .successProbability(successProbability)
                 .videoPath(fullPath)
                 // QR 다운로드용 short key (8자리)
                 .qrCodeKey(UUID.randomUUID().toString().substring(0, 8))
@@ -89,6 +100,7 @@ public class GameLogService {
                         .url(videoUrl)
                         .thumb("/logo.png") // 클라이언트가 처리할 수 있게 기본 로고 경로 지정
                         .isSuccess(isSuccess)
+                        .successProbability(successProbability)
                         .build();
                 String jsonString = objectMapper.writeValueAsString(dto);
                 String redisKey = "session:" + sessionId;
@@ -99,7 +111,7 @@ public class GameLogService {
             }
         }
 
-        return saved.getId();
+        return GameLogResponse.from(saved, videoUrl);
     }
 
     /**

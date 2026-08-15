@@ -23,6 +23,7 @@ public class GameLogResponse {
     private Long id;
     private String sessionId;
     private Boolean isSuccess;
+    private Double successProbability;
     private String qrCodeKey;
     private String videoUrl;
     private LocalDateTime createdAt;
@@ -33,6 +34,7 @@ public class GameLogResponse {
                 .id(log.getId())
                 .sessionId(log.getSessionId())
                 .isSuccess(log.getIsSuccess())
+                .successProbability(log.getSuccessProbability())
                 .qrCodeKey(log.getQrCodeKey())
                 .videoUrl(videoUrl)
                 .createdAt(log.getCreatedAt())

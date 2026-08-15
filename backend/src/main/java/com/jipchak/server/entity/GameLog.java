@@ -38,6 +38,9 @@ public class GameLog {
     @Column(nullable = false)
     private Boolean isSuccess;
 
+    /** 파지 직전 ML 모델이 예측한 성공 확률(0.0~1.0). 학습 전 기록은 null 가능. */
+    private Double successProbability;
+
     /** 영상 파일의 절대 경로. 파일이 삭제된 후에는 null. */
     private String videoPath;
 

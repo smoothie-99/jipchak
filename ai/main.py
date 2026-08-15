@@ -9,6 +9,10 @@ from src.config import (
     THREE_JAW_ENABLED, THREE_JAW_MODEL_PATH,
     THREE_JAW_MIN_BOX_AREA_RATIO, THREE_JAW_MAX_BOX_AREA_RATIO,
     THREE_JAW_MIN_MASK_FILL_RATIO, THREE_JAW_FACE_ONLY_MAX_AREA_RATIO,
+    SUCCESS_LEARNING_ENABLED, SUCCESS_LEARNING_DATA_PATH, SUCCESS_MODEL_PATH,
+    SUCCESS_LEARNING_MIN_SAMPLES, SUCCESS_LEARNING_RETRAIN_EVERY,
+    SUCCESS_LEARNING_MIN_CLASS_SAMPLES, SUCCESS_LEARNING_EPOCHS,
+    SUCCESS_LEARNING_BATCH_SIZE,
 )
 from src.inference.detection_service import DetectionService
 from src.inference.judge import CatchJudge
@@ -43,6 +47,14 @@ if THREE_JAW_ENABLED:
         max_box_area_ratio=THREE_JAW_MAX_BOX_AREA_RATIO,
         min_mask_fill_ratio=THREE_JAW_MIN_MASK_FILL_RATIO,
         face_only_max_area_ratio=THREE_JAW_FACE_ONLY_MAX_AREA_RATIO,
+        success_learning_enabled=SUCCESS_LEARNING_ENABLED,
+        success_learning_data_path=SUCCESS_LEARNING_DATA_PATH,
+        success_model_path=SUCCESS_MODEL_PATH,
+        success_learning_min_samples=SUCCESS_LEARNING_MIN_SAMPLES,
+        success_learning_retrain_every=SUCCESS_LEARNING_RETRAIN_EVERY,
+        success_learning_min_class_samples=SUCCESS_LEARNING_MIN_CLASS_SAMPLES,
+        success_learning_epochs=SUCCESS_LEARNING_EPOCHS,
+        success_learning_batch_size=SUCCESS_LEARNING_BATCH_SIZE,
     )
 session_manager = SessionManager(
     recorder=recorder, judge=judge, spring=spring,
@@ -81,5 +93,8 @@ async def health():
         "detection_loaded": detection_service.is_ready if detection_service else False,
         "three_jaw_loaded": (
             three_jaw_service is not None and three_jaw_service._pipeline is not None
+        ),
+        "success_learning": (
+            three_jaw_service.learning_status if three_jaw_service else {"enabled": False}
         ),
     }

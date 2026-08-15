@@ -4,6 +4,7 @@ from .adapters import (
     PoseArrayAdapter, YoloBoxGraspAdapter, YoloSegGraspAdapter
 )
 from .feature_extractor import FeatureExtractor
+from .success_feature_extractor import SuccessFeatureExtractor
 from .evaluator import ThreeJawEvaluator
 from .evaluator_chick import ChickEvaluator
 from .pipeline import GraspPipeline
