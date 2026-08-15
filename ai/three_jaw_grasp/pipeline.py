@@ -30,6 +30,16 @@ class GraspPipeline:
         3. 어댑터를 통한 포맷 변환 및 원본 좌표 복원
         4. 평가기를 통한 최적 파지 선택
         """
+        candidates = self.predict_candidates(rgb, depth, filename_prefix)
+        return self.evaluator.select_best(candidates, depth=depth)
+
+    def predict_candidates(
+        self,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        filename_prefix: str = None,
+    ) -> List[GraspCandidate]:
+        """모델 출력 전체를 표준 후보로 변환해 반환한다."""
         # 1. Object Detection (YOLO)
         xmin, ymin, xmax, ymax = 0, 0, rgb.shape[1], rgb.shape[0]
         crop_rgb, crop_depth = rgb, depth
@@ -69,7 +79,4 @@ class GraspPipeline:
                     padded_mask[ymin:y_end, xmin:x_end] = c.mask[:(y_end-ymin), :(x_end-xmin)]
                     c.mask = padded_mask
 
-        # 4. 최적 파지 선택
-        best_grasp = self.evaluator.select_best(candidates, depth=depth)
-        
-        return best_grasp
+        return candidates

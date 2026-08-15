@@ -14,6 +14,7 @@ class SpringClient:
     multipart/form-data 엔드포인트를 사용한다:
         - field 'sessionId' : 세션 식별자 (모바일 QR 영상 조회 키와 동일해야 함)
         - field 'isSuccess' : "true"/"false"
+        - field 'successProbability' : 파지 직전 예측 확률 0.0~1.0 (선택)
         - field 'video'     : mp4 파일
     """
 
@@ -26,6 +27,7 @@ class SpringClient:
         video_path: str,
         is_success: bool,
         session_id: Optional[str] = None,
+        success_probability: Optional[float] = None,
     ) -> Optional[dict]:
         url = f"{self.base_url}{SPRING_GAME_LOG_PATH}"
         path = Path(video_path)
@@ -42,6 +44,10 @@ class SpringClient:
                 # 저장하고, 모바일이 같은 id 로 영상 목록을 조회할 수 있다.
                 if session_id:
                     data["sessionId"] = session_id
+                if success_probability is not None:
+                    data["successProbability"] = str(
+                        max(0.0, min(float(success_probability), 1.0))
+                    )
                 resp = await self._client.post(url, files=files, data=data)
                 resp.raise_for_status()
                 return resp.json() if resp.content else {}

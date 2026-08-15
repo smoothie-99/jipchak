@@ -1,7 +1,7 @@
 # JIPCHAK AI Server
 
 라즈베리파이에서 송출한 카메라 스트림을 받아
-**브라우저 릴레이 / mp4 녹화 / 잡힘 판정 / Spring 결과 전송**을 수행하는 FastAPI 서버.
+**브라우저 릴레이 / mp4 녹화 / 잡힘 판정 / 성공 확률 자동 학습 / Spring 결과 전송**을 수행하는 FastAPI 서버.
 
 ```
 [RPi] ──WS──► [AI 서버] ──┬──► [React 브라우저] (영상 미리보기)
@@ -60,6 +60,12 @@ docker run --rm -p 8000:8000 \
 | `VIDEO_FPS` | `30` | mp4 재생 FPS |
 | `VIDEO_CODEC` | `mp4v` | OpenCV FourCC |
 | `LOG_LEVEL` | `INFO` | (예약) |
+| `SUCCESS_LEARNING_ENABLED` | `true` | 게임 결과 기반 자동 학습 활성화 |
+| `SUCCESS_LEARNING_DATA_PATH` | `/data/learning/grasp_attempts.jsonl` | 학습 데이터 JSONL 경로 |
+| `SUCCESS_MODEL_PATH` | `/data/learning/success_evaluator.pth` | 성공 확률 모델 경로 |
+| `SUCCESS_LEARNING_MIN_SAMPLES` | `30` | 최초 학습 최소 샘플 수 |
+| `SUCCESS_LEARNING_MIN_CLASS_SAMPLES` | `5` | 성공·실패 각각의 최소 샘플 수 |
+| `SUCCESS_LEARNING_RETRAIN_EVERY` | `10` | 재학습 간 신규 샘플 수 |
 
 ---
 
@@ -96,6 +102,11 @@ docker run --rm -p 8000:8000 \
 4. 게임 종료 시 RPi가 **STOP** 텍스트 송신
 5. AI 서버는 `CatchJudge` 호출 → Spring Boot에 multipart 업로드
 6. WS 연결이 STOP 없이 끊겨도 활성 세션은 자동 정리됨
+
+게임 종료 시 마지막 파지 특징에 성공/실패 라벨을 붙여 JSONL에 기록합니다.
+데이터 조건이 충족되면 MLP를 백그라운드에서 다시 학습하고, 완료된 모델만
+현재 추론기에 hot-reload합니다. `successProbability`는 영상 및 실제 결과와 함께
+Spring Boot로 전송됩니다.
 
 ### `/ws/stream` — AI → 브라우저
 
@@ -137,10 +148,12 @@ ai/
 │   │   ├── ws_rpi.py                # /ws/camera 엔드포인트
 │   │   ├── ws_browser.py            # /ws/stream 엔드포인트
 │   │   └── spring_client.py         # Spring /api/game/log POST
+│   ├── learning/
+│   │   └── success_learning.py      # 결과 누적 + 자동 재학습 + hot-reload
 │   ├── recorder/
 │   │   └── video_recorder.py        # 세션별 mp4 녹화
 │   └── inference/
-│       └── judge.py                 # 잡힘 판정 (현재 더미)
+│       └── judge.py                 # Depth 변화 기반 성공 판정
 └── tests/
     ├── test_unpacker.py
     ├── test_relay_hub.py
@@ -155,7 +168,6 @@ ai/
 
 ```bash
 .venv/Scripts/python -m pytest tests/ -v
-# 21 passed in <1s
 ```
 
 ## RPi 없이 검증하기
@@ -183,7 +195,7 @@ npx wscat -c ws://localhost:8000/ws/stream --no-color
 ## 향후 개선 사항
 
 - [ ] `print()` → `logging` 전환 (uvicorn 라이브 로그 출력 정렬)
-- [ ] 잡힘 판정 실로직 (Depth 임계값 → ONNX 모델)
+- [ ] Depth 성공 판정 임계값의 장비별 자동 보정
 - [ ] cv2.VideoWriter 동기 호출을 `asyncio.to_thread` 로 오프로드
 - [ ] 영상 업로드 실패 시 재시도 큐
 - [ ] WSS (TLS) — Nginx upstream에서 종단

@@ -45,7 +45,9 @@ const CameraView = ({
   const lastSessionEvent = useStreamStore((s: StreamState) => s.lastSessionEvent);
 
   const hasDetection = graspPose !== null || detections.length > 0;
-  const currentProbability = hasDetection ? Math.min((graspScore ?? 0) * 1000, 90) : 0;
+  const currentProbability = hasDetection
+    ? Math.max(0, Math.min((graspScore ?? 0) * 100, 100))
+    : 0;
 
   // 타이머 작동 상태, 집게 하강 상태, 화면에 표시할 확률값 관리
   const [timerStarted, setTimerStarted] = useState(false);
@@ -336,7 +338,7 @@ function drawGraspPose(
   ctx.font = 'bold 80px Arial';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(`${Math.min(pose.confidence * 1000, 90).toFixed(0)}`, cx, cy);
+  ctx.fillText(`${Math.max(0, Math.min(pose.confidence * 100, 100)).toFixed(0)}%`, cx, cy);
 
   ctx.restore();
 }
@@ -377,7 +379,7 @@ function drawDetections(
     ctx.strokeRect(xmin, ymin, xmax - xmin, ymax - ymin);
     ctx.setLineDash([]);
 
-    const text = `${Math.min(det.grasp_confidence * 1000, 90).toFixed(0)}%`;
+    const text = `${Math.max(0, Math.min(det.grasp_confidence * 100, 100)).toFixed(0)}%`;
     ctx.font = 'bold 14px Arial';
     const tw = ctx.measureText(text).width;
     ctx.fillStyle = isBest ? getThermometerColor(det.grasp_confidence, 0.8) : 'rgba(0, 0, 0, 0.6)';
@@ -414,7 +416,7 @@ function drawDetections(
   ctx.font = 'bold 14px Arial';
   ctx.textAlign = 'left';
   ctx.fillText(
-    `Best: ${Math.min(best.grasp_confidence * 1000, 90).toFixed(1)}%  (${detections.length} obj)`,
+    `Best: ${Math.max(0, Math.min(best.grasp_confidence * 100, 100)).toFixed(1)}%  (${detections.length} obj)`,
     14,
     27,
   );
@@ -426,7 +428,7 @@ export default CameraView;
 // 헬퍼: 온도계 컴포넌트와 동일한 색상 보간 (Blue -> Green -> Yellow -> Red)
 // ─────────────────────────────────────────
 function getThermometerColor(confidence: number, alpha: number = 1): string {
-  const v = Math.min(confidence * 1000, 90);
+  const v = Math.max(0, Math.min(confidence * 100, 100));
   let r, g, b;
   if (v <= 30) {
     const p = v / 30;

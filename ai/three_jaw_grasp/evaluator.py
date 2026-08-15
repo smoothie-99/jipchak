@@ -1,4 +1,5 @@
 import math
+import threading
 from typing import List, Optional
 
 import numpy as np
@@ -48,41 +49,66 @@ class ThreeJawEvaluator:
         # 학습 시 train split 으로 fit, .pth 에 함께 저장됨. 없으면 calibration 없이 raw sigmoid 사용.
         self._iso_x: Optional[np.ndarray] = None  # 정렬된 score boundary
         self._iso_y: Optional[np.ndarray] = None  # 각 boundary 의 평균 라벨 (단조)
+        self._model_metadata: dict = {}
+        self._model_lock = threading.RLock()
 
         if model_path:
-            ckpt = torch.load(model_path, map_location="cpu")
-            # 새 포맷(dict with state_dict + norm stats) vs 구포맷(state_dict only) 모두 지원
+            self.load_model(model_path)
+
+    @property
+    def prediction_source(self) -> str:
+        return "ml" if self.model is not None else "rule"
+
+    @property
+    def model_metadata(self) -> dict:
+        return dict(self._model_metadata)
+
+    def load_model(self, model_path: str) -> bool:
+        """새 체크포인트를 완전히 검증한 뒤 추론 모델을 원자적으로 교체한다."""
+        try:
+            ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+            model = GraspScoreMLP(self.extractor.FEATURE_DIM)
+            norm_mean = None
+            norm_std = None
+            iso_x = None
+            iso_y = None
+            metadata = {}
+
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                self.model = GraspScoreMLP(self.extractor.FEATURE_DIM)
-                self.model.load_state_dict(ckpt["state_dict"])
+                feature_dim = int(ckpt.get("feature_dim", self.extractor.FEATURE_DIM))
+                if feature_dim != self.extractor.FEATURE_DIM:
+                    raise ValueError(
+                        f"feature_dim mismatch: model={feature_dim}, "
+                        f"runtime={self.extractor.FEATURE_DIM}"
+                    )
+                model.load_state_dict(ckpt["state_dict"])
                 if "norm_mean" in ckpt and "norm_std" in ckpt:
-                    self._norm_mean = np.asarray(ckpt["norm_mean"], dtype=np.float32)
-                    self._norm_std = np.asarray(ckpt["norm_std"], dtype=np.float32)
-                    print(
-                        f"[ThreeJawEvaluator] loaded model + normalization stats "
-                        f"(dim={self.extractor.FEATURE_DIM})"
-                    )
-                else:
-                    print(
-                        "[ThreeJawEvaluator] WARNING: model loaded without normalization stats — "
-                        "추론 점수가 학습 시와 일치하지 않을 수 있음"
-                    )
+                    norm_mean = np.asarray(ckpt["norm_mean"], dtype=np.float32)
+                    norm_std = np.asarray(ckpt["norm_std"], dtype=np.float32)
                 if "iso_x" in ckpt and "iso_y" in ckpt:
-                    self._iso_x = np.asarray(ckpt["iso_x"], dtype=np.float64)
-                    self._iso_y = np.asarray(ckpt["iso_y"], dtype=np.float64)
-                    print(
-                        f"[ThreeJawEvaluator] isotonic calibration loaded "
-                        f"({len(self._iso_x)} points) — sigmoid → 진짜 확률 변환 활성"
-                    )
+                    iso_x = np.asarray(ckpt["iso_x"], dtype=np.float64)
+                    iso_y = np.asarray(ckpt["iso_y"], dtype=np.float64)
+                metadata = dict(ckpt.get("metadata", {}))
             else:
-                # 구포맷: raw state_dict
-                self.model = GraspScoreMLP(self.extractor.FEATURE_DIM)
-                self.model.load_state_dict(ckpt)
-                print(
-                    "[ThreeJawEvaluator] loaded legacy model (no norm stats) — "
-                    "trainer.py 로 재학습 권장"
-                )
-            self.model.eval()
+                model.load_state_dict(ckpt)
+
+            model.eval()
+            with self._model_lock:
+                self.model = model
+                self._norm_mean = norm_mean
+                self._norm_std = norm_std
+                self._iso_x = iso_x
+                self._iso_y = iso_y
+                self._model_metadata = metadata
+
+            print(
+                f"[ThreeJawEvaluator] ML model loaded "
+                f"(dim={self.extractor.FEATURE_DIM}, samples={metadata.get('sample_count', '?')})"
+            )
+            return True
+        except Exception as exc:
+            print(f"[ThreeJawEvaluator] model load skipped: {exc}")
+            return False
 
     def select_best(
         self, candidates: List[GraspCandidate], depth: Optional[np.ndarray] = None
@@ -104,6 +130,14 @@ class ThreeJawEvaluator:
         if self.model:
             return list(self._mlp_scores(candidates, depth))
         return [self._calculate_rule_score(c, depth) for c in candidates]
+
+    def success_probability(
+        self, candidate: GraspCandidate, depth: Optional[np.ndarray] = None
+    ) -> float:
+        """학습 모델이 있으면 보정된 확률, 없으면 규칙 기반 초기 점수를 반환한다."""
+        if self.model is not None:
+            return float(self._mlp_scores([candidate], depth)[0])
+        return float(self._calculate_rule_score(candidate, depth))
 
     def _width_fitness(self, g: GraspCandidate) -> float:
         spec = self.config["gripper"]
@@ -200,23 +234,34 @@ class ThreeJawEvaluator:
         self, candidates: List[GraspCandidate], depth: Optional[np.ndarray]
     ) -> np.ndarray:
         features = self.extractor.extract_batch(candidates, depth)
+        with self._model_lock:
+            model = self.model
+            norm_mean = self._norm_mean
+            norm_std = self._norm_std
+            iso_x = self._iso_x
+            iso_y = self._iso_y
+        if model is None:
+            return np.asarray(
+                [self._calculate_rule_score(c, depth) for c in candidates],
+                dtype=np.float32,
+            )
         # 학습 시 적용한 정규화를 동일하게 적용 (없으면 raw 사용 — 단 학습/추론 불일치 위험)
-        if self._norm_mean is not None and self._norm_std is not None:
-            features = (features - self._norm_mean) / self._norm_std
+        if norm_mean is not None and norm_std is not None:
+            features = (features - norm_mean) / norm_std
         with torch.no_grad():
             tensor = torch.from_numpy(features.astype(np.float32))
-            scores = self.model(tensor).squeeze().numpy()
+            scores = model(tensor).squeeze().numpy()
 
         scores = np.atleast_1d(scores)
 
         # Isotonic calibration: sigmoid 출력 -> 진짜 확률
         # mapping 이 있으면 raw sigmoid 점수를 학습 시 fit 된 보정 곡선으로 변환.
-        if self._iso_x is not None and self._iso_y is not None:
-            scores = np.interp(scores, self._iso_x, self._iso_y)
+        if iso_x is not None and iso_y is not None:
+            scores = np.interp(scores, iso_x, iso_y)
 
-        mask_multipliers = np.array([self._mask_fitness(c) for c in candidates])
-        scores = scores * mask_multipliers
-        scores = np.clip(scores, 0.0, 0.90)
+        # 보정된 ML 출력은 실제 성공률을 직접 나타낸다. 여기서 규칙 기반
+        # multiplier를 다시 곱하면 calibration이 깨지므로 후처리 가중치는 적용하지 않는다.
+        scores = np.clip(scores, 0.0, 1.0)
         return scores
 
     def _load_config(self, path: Optional[str]) -> dict:

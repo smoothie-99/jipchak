@@ -21,6 +21,7 @@ class GameSession:
     last_depth_frame: Optional[np.ndarray] = None
     frame_count: int = 0
     started: bool = False
+    last_success_probability: Optional[float] = None
 
 
 class SessionManager:
@@ -69,6 +70,8 @@ class SessionManager:
         if existing is not None:
             print(f"[SessionManager] duplicate START for {session_id}, closing previous")
             self._recorder.stop_session(session_id)
+            if self._three_jaw is not None:
+                self._three_jaw.discard_attempt(session_id)
 
         async with self._lock:
             self._sessions[session_id] = GameSession(session_id=session_id)
@@ -146,8 +149,9 @@ class SessionManager:
 
         # 1. YOLO26s-seg ThreeJawGrasp (1순위)
         if self._three_jaw is not None:
-            pose = self._three_jaw.infer(rgb, depth)
+            pose = self._three_jaw.infer(rgb, depth, session_id=session_id)
             if pose is not None:
+                session.last_success_probability = float(pose["confidence"])
                 print(
                     f"[SessionManager] three_jaw: "
                     f"conf={pose['confidence']:.2f} "
@@ -247,10 +251,16 @@ class SessionManager:
             f"judge={result}"
         )
 
+        # 마지막 추론 특징에 실제 결과를 라벨링한다. 데이터 조건이 충족되면
+        # AutoSuccessLearner가 백그라운드에서 재학습하고 모델을 hot-reload한다.
+        if self._three_jaw is not None:
+            self._three_jaw.record_outcome(session_id, result.is_caught)
+
         # session_id 를 함께 전달 — Spring 이 Redis 키 (session:{id}) 로 저장하고
         # 모바일이 같은 id 로 영상 목록을 조회할 수 있게 한다.
         return await self._spring.upload_game_log(
             video_path=video_path,
             is_success=result.is_caught,
             session_id=session_id,
+            success_probability=session.last_success_probability,
         )

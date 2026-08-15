@@ -34,11 +34,19 @@ class FakeRecorder:
 
 class FakeSpring:
     def __init__(self) -> None:
-        self.uploads: list[tuple[str, bool, str | None]] = []
+        self.uploads: list[tuple[str, bool, str | None, float | None]] = []
         self.response = {"id": 42}
 
-    async def upload_game_log(self, video_path: str, is_success: bool, session_id: str | None = None):
-        self.uploads.append((video_path, is_success, session_id))
+    async def upload_game_log(
+        self,
+        video_path: str,
+        is_success: bool,
+        session_id: str | None = None,
+        success_probability: float | None = None,
+    ):
+        self.uploads.append(
+            (video_path, is_success, session_id, success_probability)
+        )
         return self.response
 
     async def close(self):
@@ -82,7 +90,7 @@ async def test_full_lifecycle_records_judges_and_uploads(parts):
     assert rec.started == ["s1"]
     assert rec.frames_written["s1"] == 2
     assert rec.stopped == ["s1"]
-    assert spring.uploads == [("/tmp/s1.mp4", True, "s1")]
+    assert spring.uploads == [("/tmp/s1.mp4", True, "s1", None)]
 
 
 async def test_on_frame_without_session_is_noop(parts):
@@ -136,4 +144,4 @@ async def test_judge_lose_uploads_with_false_flag(parts):
     await sm.on_frame("loser", _color(), _depth())
     await sm.stop("loser")
 
-    assert spring.uploads == [("/tmp/loser.mp4", False, "loser")]
+    assert spring.uploads == [("/tmp/loser.mp4", False, "loser", None)]

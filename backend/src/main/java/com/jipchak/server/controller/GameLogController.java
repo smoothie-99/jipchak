@@ -27,12 +27,14 @@ public class GameLogController {
     private final GameLogService gameLogService;
 
     @PostMapping("/log")
-    public ResponseEntity<Long> createGameLog(
+    public ResponseEntity<GameLogResponse> createGameLog(
             // sessionId 는 AI 서버가 발급한 세션 식별자. 없으면 anon 으로 처리.
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam("isSuccess") Boolean isSuccess,
+            @RequestParam(value = "successProbability", required = false) Double successProbability,
             @RequestParam("video") MultipartFile video) throws IOException {
-        Long savedId = gameLogService.saveGameLog(sessionId, isSuccess, video);
-        return ResponseEntity.status(HttpStatus.CREATED).body(savedId);
+        GameLogResponse saved = gameLogService.saveGameLog(
+                sessionId, isSuccess, successProbability, video);
+        return ResponseEntity.status(HttpStatus.CREATED).body(saved);
     }
 }

@@ -184,17 +184,16 @@ function connect() {
             try {
                 const msg = JSON.parse(event.data);
                 if (msg.event === 'GRASP_POSE' && typeof msg.confidence === 'number') {
-                    // 인형 인식 시 확률을 50~60 사이로 하드코딩 (0.050 ~ 0.060에 1000이 곱해져 UI에 표시됨)
-                    const hardcodedConfidence = 0.050 + Math.random() * 0.010;
+                    const confidence = Math.max(0, Math.min(1, msg.confidence));
                     useStreamStore.setState({
-                        graspScore: hardcodedConfidence,
+                        graspScore: confidence,
                         graspPose: {
                             center_x: msg.center_x,
                             center_y: msg.center_y,
                             angle_rad: msg.angle_rad,
                             radius: msg.radius,
                             jaw_count: msg.jaw_count,
-                            confidence: hardcodedConfidence,
+                            confidence,
                             image_width: msg.image_width,
                             image_height: msg.image_height,
                         },
@@ -202,11 +201,15 @@ function connect() {
                     });
                     armDetectionStaleTimer();
                 } else if (msg.event === 'GRASP_SCORE' && typeof msg.confidence === 'number') {
-                    const hardcodedConfidence = 0.050 + Math.random() * 0.010;
+                    const confidence = Math.max(0, Math.min(1, msg.confidence));
                     useStreamStore.setState({
-                        graspScore: hardcodedConfidence,
-                        // 박스가 여러 개일 경우 각 박스마다 50~60 사이의 미세하게 다른 랜덤 값을 부여
-                        detections: Array.isArray(msg.detections) ? msg.detections.map((d: any) => ({ ...d, grasp_confidence: 0.050 + Math.random() * 0.010 })) : [],
+                        graspScore: confidence,
+                        detections: Array.isArray(msg.detections)
+                            ? msg.detections.map((d: DetectionItem) => ({
+                                ...d,
+                                grasp_confidence: Math.max(0, Math.min(1, d.grasp_confidence)),
+                            }))
+                            : [],
                         graspPose: null, // 다른 경로 결과는 비움
                     });
                     armDetectionStaleTimer();

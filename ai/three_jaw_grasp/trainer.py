@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -29,12 +30,14 @@ class GraspDataset(Dataset):
         self.std = std
 
     @classmethod
-    def from_jsonl(cls, data_path: str) -> "GraspDataset":
+    def from_jsonl(
+        cls, data_path: str, feature_dim: int = FeatureExtractor.FEATURE_DIM
+    ) -> "GraspDataset":
         samples: list[dict] = []
         with open(data_path, 'r', encoding='utf-8') as f:
             for line in f:
                 log = json.loads(line)
-                if len(log.get('features', [])) == FeatureExtractor.FEATURE_DIM:
+                if len(log.get('features', [])) == feature_dim:
                     samples.append({
                         "features": np.asarray(log['features'], dtype=np.float32),
                         "label": float(log['success']),
@@ -58,11 +61,22 @@ class GraspDataset(Dataset):
 def _split_samples(
     samples: list[dict], val_ratio: float, seed: int
 ) -> tuple[list[dict], list[dict]]:
+    """성공/실패가 train과 validation 양쪽에 남도록 계층 분할한다."""
     rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(samples))
-    n_val = max(1, int(len(samples) * val_ratio))
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
+    labels = np.asarray([int(sample["label"]) for sample in samples])
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+    for label in (0, 1):
+        class_idx = np.flatnonzero(labels == label)
+        class_idx = rng.permutation(class_idx)
+        n_val = min(
+            len(class_idx) - 1,
+            max(1, int(round(len(class_idx) * val_ratio))),
+        )
+        val_idx.extend(class_idx[:n_val].tolist())
+        train_idx.extend(class_idx[n_val:].tolist())
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
     return [samples[i] for i in train_idx], [samples[i] for i in val_idx]
 
 
@@ -116,6 +130,8 @@ def train_evaluator_model(
     patience: int = 15,
     val_ratio: float = 0.2,
     seed: int = 0,
+    feature_dim: int = FeatureExtractor.FEATURE_DIM,
+    metadata: Optional[dict] = None,
 ):
     """
     데이터셋으로 GraspScoreMLP 모델을 학습하고 저장한다.
@@ -135,10 +151,15 @@ def train_evaluator_model(
     """
     torch.manual_seed(seed)
 
-    full = GraspDataset.from_jsonl(data_path)
-    if len(full) == 0:
-        print(f"오류: '{data_path}'에서 유효한 학습 데이터를 찾을 수 없습니다.")
-        return
+    full = GraspDataset.from_jsonl(data_path, feature_dim=feature_dim)
+    if len(full) < 4:
+        raise ValueError(
+            f"학습에는 최소 4개의 유효한 샘플이 필요합니다: {data_path} ({len(full)}개)"
+        )
+
+    labels = [int(sample["label"]) for sample in full.samples]
+    if len(set(labels)) < 2:
+        raise ValueError("성공과 실패 데이터가 모두 있어야 학습할 수 있습니다.")
 
     train_samples, val_samples = _split_samples(full.samples, val_ratio, seed)
 
@@ -153,7 +174,7 @@ def train_evaluator_model(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
 
-    model = GraspScoreMLP(input_dim=FeatureExtractor.FEATURE_DIM)
+    model = GraspScoreMLP(input_dim=feature_dim)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -216,13 +237,12 @@ def train_evaluator_model(
             break
 
     if best_state is None:
-        print("학습 실패: best state 없음")
-        return
+        raise RuntimeError("학습 실패: best state 없음")
 
     # Isotonic calibration: best 모델로 val split 추론 → 출력을 진짜 확률에 매핑
     # PAV 알고리즘으로 단조 증가 step function 학습. (sigmoid 출력은 ranking 신호일 뿐
     # 실제 확률과 어긋남 — 합성 데이터 검증에서 ECE 0.27 -> 0.02 로 감소함)
-    best_model = GraspScoreMLP(input_dim=FeatureExtractor.FEATURE_DIM)
+    best_model = GraspScoreMLP(input_dim=feature_dim)
     best_model.load_state_dict(best_state)
     best_model.eval()
     val_scores: list[float] = []
@@ -241,10 +261,11 @@ def train_evaluator_model(
         f"({len(val_scores)} samples → {len(iso_x)} unique boundaries)"
     )
 
-    torch.save(
-        {
+    output_path = Path(save_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = {
             "state_dict": best_state,
-            "feature_dim": FeatureExtractor.FEATURE_DIM,
+            "feature_dim": feature_dim,
             "norm_mean": mean.tolist(),
             "norm_std": std.tolist(),
             "best_epoch": best_epoch,
@@ -252,14 +273,20 @@ def train_evaluator_model(
             "best_val_acc": float(best_val_acc),
             "iso_x": iso_x.tolist(),
             "iso_y": iso_y.tolist(),
-        },
-        save_path,
-    )
+            "metadata": metadata or {},
+        }
+    torch.save(checkpoint, output_path)
     print(
         f"\n학습 완료. best epoch={best_epoch} "
         f"val_loss={best_val_loss:.4f} val_acc={best_val_acc:.2f}% "
         f"→ '{save_path}'"
     )
+    return {
+        "sample_count": len(full),
+        "best_epoch": best_epoch,
+        "best_val_loss": float(best_val_loss),
+        "best_val_acc": float(best_val_acc),
+    }
 
 
 if __name__ == '__main__':
