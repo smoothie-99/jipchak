@@ -9,8 +9,10 @@ class FakeWebSocket:
     def __init__(self, fail_after: int | None = None) -> None:
         self.received: list[bytes] = []
         self.fail_after = fail_after  # N번째 send부터 실패
+        self.send_attempted = asyncio.Event()
 
     async def send_bytes(self, payload: bytes) -> None:
+        self.send_attempted.set()
         if self.fail_after is not None and len(self.received) >= self.fail_after:
             raise ConnectionError("simulated client gone")
         self.received.append(payload)
@@ -23,10 +25,13 @@ async def test_subscribe_and_broadcast_to_all_clients():
     await hub.subscribe(b)
 
     await hub.broadcast(b"hello")
+    await asyncio.wait_for(asyncio.gather(a.send_attempted.wait(), b.send_attempted.wait()), 1)
 
     assert a.received == [b"hello"]
     assert b.received == [b"hello"]
     assert hub.subscriber_count == 2
+    await hub.unsubscribe(a)
+    await hub.unsubscribe(b)
 
 
 async def test_unsubscribe_stops_receiving():
@@ -37,10 +42,12 @@ async def test_unsubscribe_stops_receiving():
     await hub.unsubscribe(a)
 
     await hub.broadcast(b"x")
+    await asyncio.wait_for(b.send_attempted.wait(), 1)
 
     assert a.received == []
     assert b.received == [b"x"]
     assert hub.subscriber_count == 1
+    await hub.unsubscribe(b)
 
 
 async def test_dead_client_is_auto_cleaned():
@@ -51,10 +58,14 @@ async def test_dead_client_is_auto_cleaned():
     await hub.subscribe(dead)
 
     await hub.broadcast(b"ping")
+    await asyncio.wait_for(asyncio.gather(healthy.send_attempted.wait(), dead.send_attempted.wait()), 1)
+    # The next producer pass removes channels whose asynchronous send has failed.
+    await hub.broadcast(b"next")
 
     # dead client는 자동 제거, healthy는 정상 수신
     assert hub.subscriber_count == 1
     assert healthy.received == [b"ping"]
+    await hub.unsubscribe(healthy)
 
 
 async def test_broadcast_with_no_clients_is_noop():

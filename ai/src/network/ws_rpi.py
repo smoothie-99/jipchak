@@ -189,6 +189,8 @@ async def _apply_control(
             "event": "GAME_RESULT",
             "session_id": session_id,
             "is_caught": judge.is_caught if judge else False,
+            "outcome_status": judge.outcome_status if judge else "unknown",
+            "outcome_reason": judge.reason if judge else "missing_result",
             "confidence": judge.confidence if judge else 0.0,
             "success_probability": (
                 result.get("successProbability")
@@ -197,6 +199,13 @@ async def _apply_control(
             ),
         }).encode())
         return None
+
+    if event == "GRAB_START":
+        active_id = current_session or session_manager.get_active_session_id()
+        if active_id is not None:
+            session_manager.freeze_attempt(active_id)
+        await relay_hub.broadcast_text(text.encode())
+        return current_session
 
     # 사용자가 POST_GAME 에서 파란 버튼을 눌러 세션을 명시적으로 종료한 경우.
     # 5판 미만이어도 즉시 QR 안내 화면으로 전환하도록 브라우저에 릴레이.

@@ -7,6 +7,7 @@ from three_jaw_grasp.adapters import YoloSegGraspAdapter
 from three_jaw_grasp.evaluator_chick import ChickEvaluator
 from three_jaw_grasp.success_feature_extractor import SuccessFeatureExtractor
 from src.learning import AutoSuccessLearner
+from src.learning.promotion import PromotionPolicy
 
 
 class Yolo26sSegWrapper:
@@ -143,6 +144,9 @@ class ThreeJawGraspService:
         success_learning_min_class_samples: int = 5,
         success_learning_epochs: int = 120,
         success_learning_batch_size: int = 32,
+        success_holdout_ratio: float = 0.2,
+        success_max_observation_age: float = 2.0,
+        success_promotion_policy: PromotionPolicy | None = None,
     ):
         self._pipeline = None
         self._learner = None
@@ -159,6 +163,9 @@ class ThreeJawGraspService:
         self._success_learning_min_class_samples = success_learning_min_class_samples
         self._success_learning_epochs = success_learning_epochs
         self._success_learning_batch_size = success_learning_batch_size
+        self._success_holdout_ratio = success_holdout_ratio
+        self._success_max_observation_age = success_max_observation_age
+        self._success_promotion_policy = success_promotion_policy
 
     def load(self, model_path: str) -> None:
         """
@@ -199,6 +206,9 @@ class ThreeJawGraspService:
             min_class_samples=self._success_learning_min_class_samples,
             epochs=self._success_learning_epochs,
             batch_size=self._success_learning_batch_size,
+            holdout_ratio=self._success_holdout_ratio,
+            max_observation_age=self._success_max_observation_age,
+            promotion_policy=self._success_promotion_policy,
         )
         print(f"[ThreeJawGraspService] Pipeline 로드 완료 (YOLO: {model_path})")
 
@@ -207,6 +217,8 @@ class ThreeJawGraspService:
         color_bgr: np.ndarray,
         depth_mm: np.ndarray,
         session_id: str | None = None,
+        observed_at: float | None = None,
+        attempt_id: str | None = None,
     ) -> dict | None:
         if self._pipeline is None:
             print("[ThreeJawGraspService] _pipeline is None (load 실패?)")
@@ -284,10 +296,9 @@ class ThreeJawGraspService:
 
             # 학습 모델이 있으면 실제 성공/실패 데이터로 보정된 확률을 사용한다.
             # 데이터 부족 시에만 기존 규칙 점수가 초기값으로 동작한다.
-            grasp_probability = self._pipeline.evaluator.success_probability(
+            grasp_probability, prediction_source, prediction_version = self._pipeline.evaluator.predict_with_source(
                 best, depth_m
             )
-            prediction_source = self._pipeline.evaluator.prediction_source
             # ML 모델은 gripper_distance_ratio를 직접 학습하므로 거리 감점을
             # 다시 곱하지 않는다. 규칙 기반 초기 단계에서만 centering을 별도 반영한다.
             final_confidence = float(
@@ -305,8 +316,11 @@ class ThreeJawGraspService:
                     candidate=best,
                     depth=depth_m,
                     predicted_probability=final_confidence,
+                    observed_at=observed_at,
+                    attempt_id=attempt_id,
                     metadata={
                         "prediction_source": prediction_source,
+                        "model_version": prediction_version,
                         "rule_score": float(score_info.get("total", 0.0)),
                         "centering_weight": float(centering_weight),
                         "doll_type": score_info.get("doll_type", "unknown"),
@@ -350,11 +364,18 @@ class ThreeJawGraspService:
             print(f"[ThreeJawGraspService] infer error: {e}")
             return None
 
-    def record_outcome(self, session_id: str, success: bool) -> bool:
+    def begin_attempt(self, session_id: str, attempt_id: str) -> None:
+        if self._learner is not None:
+            self._learner.begin_attempt(session_id, attempt_id)
+
+    def freeze_attempt(self, session_id: str) -> float | None:
+        return self._learner.freeze_attempt(session_id) if self._learner else None
+
+    def record_outcome(self, session_id: str, success: bool, **kwargs) -> bool:
         """마지막 파지 관측값에 성공/실패 라벨을 붙이고 자동 재학습을 예약한다."""
         if self._learner is None:
             return False
-        return self._learner.complete_attempt(session_id, success)
+        return self._learner.complete_attempt(session_id, success, **kwargs)
 
     def discard_attempt(self, session_id: str) -> None:
         if self._learner is not None:
@@ -372,4 +393,9 @@ class ThreeJawGraspService:
             "success": stats.success,
             "failure": stats.failure,
             "prediction_source": self._pipeline.evaluator.prediction_source,
+            "training_samples": self._learner.dataset_stats("train").total,
+            "holdout_samples": self._learner.dataset_stats("promotion").total,
+            "model_version": self._pipeline.evaluator.model_metadata.get("model_version", "legacy"),
+            "recovery_source": self._learner.recovery_source,
+            "last_promotion": self._learner.last_promotion,
         }

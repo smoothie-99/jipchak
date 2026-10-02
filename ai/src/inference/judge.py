@@ -9,6 +9,14 @@ class JudgeResult:
     is_caught: bool
     confidence: float       # 0.0 ~ 1.0
     method: str             # 'depth_diff' | 'dummy'
+    is_valid: bool = True
+    reason: str = ""
+
+    @property
+    def outcome_status(self) -> str:
+        if not self.is_valid or self.method == "dummy":
+            return "unknown"
+        return "success" if self.is_caught else "failure"
 
 
 class CatchJudge:
@@ -39,13 +47,13 @@ class CatchJudge:
         first_depth_frame: Optional[np.ndarray] = None,
     ) -> JudgeResult:
         if first_depth_frame is None or depth_frame is None:
-            return JudgeResult(is_caught=False, confidence=0.0, method="dummy")
+            return JudgeResult(False, 0.0, "dummy", False, "missing_depth")
 
         first = first_depth_frame.astype(np.float32)
         last = depth_frame.astype(np.float32)
 
-        if first.shape != last.shape:
-            return JudgeResult(is_caught=False, confidence=0.0, method="dummy")
+        if first.ndim != 2 or first.shape != last.shape:
+            return JudgeResult(False, 0.0, "dummy", False, "depth_shape_mismatch")
 
         h, w = first.shape[:2]
         m = self.roi_margin
@@ -55,9 +63,9 @@ class CatchJudge:
         roi_first = first[y0:y1, x0:x1]
         roi_last = last[y0:y1, x0:x1]
 
-        valid = (roi_first > 0) & (roi_last > 0)
+        valid = (roi_first > 0) & (roi_last > 0) & np.isfinite(roi_first) & np.isfinite(roi_last)
         if valid.sum() < 100:
-            return JudgeResult(is_caught=False, confidence=0.0, method="depth_diff")
+            return JudgeResult(False, 0.0, "depth_diff", False, "insufficient_valid_depth")
 
         diff = roi_last[valid] - roi_first[valid]
 

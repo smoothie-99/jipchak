@@ -13,7 +13,12 @@ from src.config import (
     SUCCESS_LEARNING_MIN_SAMPLES, SUCCESS_LEARNING_RETRAIN_EVERY,
     SUCCESS_LEARNING_MIN_CLASS_SAMPLES, SUCCESS_LEARNING_EPOCHS,
     SUCCESS_LEARNING_BATCH_SIZE,
+    SUCCESS_HOLDOUT_RATIO, SUCCESS_MAX_OBSERVATION_AGE,
+    SUCCESS_PROMOTION_MIN_SAMPLES, SUCCESS_PROMOTION_MIN_CLASS_SAMPLES,
+    SUCCESS_PROMOTION_MIN_BRIER_IMPROVEMENT, SUCCESS_PROMOTION_MAX_LOG_LOSS_REGRESSION,
+    SUCCESS_PROMOTION_MIN_SLICE_SAMPLES, SUCCESS_PROMOTION_MAX_SLICE_BRIER_REGRESSION,
 )
+from src.learning.promotion import PromotionPolicy
 from src.inference.detection_service import DetectionService
 from src.inference.judge import CatchJudge
 from src.inference.grasp_service import GraspService
@@ -55,6 +60,16 @@ if THREE_JAW_ENABLED:
         success_learning_min_class_samples=SUCCESS_LEARNING_MIN_CLASS_SAMPLES,
         success_learning_epochs=SUCCESS_LEARNING_EPOCHS,
         success_learning_batch_size=SUCCESS_LEARNING_BATCH_SIZE,
+        success_holdout_ratio=SUCCESS_HOLDOUT_RATIO,
+        success_max_observation_age=SUCCESS_MAX_OBSERVATION_AGE,
+        success_promotion_policy=PromotionPolicy(
+            min_samples=SUCCESS_PROMOTION_MIN_SAMPLES,
+            min_class_samples=SUCCESS_PROMOTION_MIN_CLASS_SAMPLES,
+            min_brier_improvement=SUCCESS_PROMOTION_MIN_BRIER_IMPROVEMENT,
+            max_log_loss_regression=SUCCESS_PROMOTION_MAX_LOG_LOSS_REGRESSION,
+            min_slice_samples=SUCCESS_PROMOTION_MIN_SLICE_SAMPLES,
+            max_slice_brier_regression=SUCCESS_PROMOTION_MAX_SLICE_BRIER_REGRESSION,
+        ),
     )
 session_manager = SessionManager(
     recorder=recorder, judge=judge, spring=spring,

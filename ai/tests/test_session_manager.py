@@ -1,4 +1,7 @@
 from typing import Optional
+from unittest.mock import Mock
+import asyncio
+import threading
 
 import numpy as np
 import pytest
@@ -145,3 +148,83 @@ async def test_judge_lose_uploads_with_false_flag(parts):
     await sm.stop("loser")
 
     assert spring.uploads == [("/tmp/loser.mp4", False, "loser", None)]
+
+
+def _three_jaw():
+    return Mock(
+        infer=Mock(return_value={"confidence": 0.9, "center_x": 1, "center_y": 2}),
+        freeze_attempt=Mock(return_value=0.6),
+    )
+
+
+async def test_unknown_judgement_is_excluded_and_frozen_probability_is_uploaded(parts):
+    sm, _, spring = parts
+    service = _three_jaw()
+    sm._three_jaw = service
+    sm._judge = CatchJudge()
+    await sm.start("s")
+    await sm.on_frame("s", _color(), None)
+    sm.freeze_attempt("s")
+    await sm.stop("s")
+    assert service.record_outcome.call_args.kwargs["outcome_valid"] is False
+    assert service.record_outcome.call_args.kwargs["outcome_metadata"]["outcome_status"] == "unknown"
+    assert spring.uploads[0][-1] == 0.6
+
+
+async def test_round_without_grab_event_is_not_used_for_learning(parts):
+    sm, _, _ = parts
+    sm._three_jaw = _three_jaw()
+    await sm.start("s")
+    await sm.on_frame("s", _color(), _depth())
+    await sm.stop("s")
+    assert sm._three_jaw.record_outcome.call_args.kwargs["outcome_valid"] is False
+
+
+async def test_inflight_inference_cannot_overwrite_frozen_probability(parts):
+    sm, _, spring = parts
+    service = _three_jaw()
+    sm._three_jaw = service
+    entered, release = threading.Event(), threading.Event()
+    def infer(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return {"confidence": 0.9, "center_x": 1, "center_y": 2}
+    service.infer.side_effect = infer
+    await sm.start("s")
+    await sm.on_frame("s", _color(), _depth())
+    def infer_sync():
+        return asyncio.run(sm.infer_grasp("s"))
+    task = asyncio.create_task(asyncio.to_thread(infer_sync))
+    assert await asyncio.to_thread(entered.wait, 3)
+    sm.freeze_attempt("s")
+    release.set()
+    assert await task is None
+    assert await sm.infer_grasp("s") is None
+    await sm.stop("s")
+    assert spring.uploads[0][-1] == 0.6
+    assert service.record_outcome.call_args.kwargs["outcome_valid"] is True
+
+
+async def test_grab_control_freezes_active_session_and_preserves_browser_event(parts):
+    from src.network.ws_rpi import _apply_control
+    from unittest.mock import AsyncMock
+    sm, _, _ = parts
+    sm._three_jaw = _three_jaw()
+    await sm.start("s")
+    hub = Mock(broadcast_text=AsyncMock())
+    assert await _apply_control('{"event":"GRAB_START"}', sm, hub, "s") == "s"
+    sm._three_jaw.freeze_attempt.assert_called_once_with("s")
+    hub.broadcast_text.assert_awaited_once()
+    await sm.stop("s")
+
+
+async def test_learning_disk_failure_does_not_prevent_result_upload(parts):
+    sm, _, spring = parts
+    sm._three_jaw = _three_jaw()
+    sm._three_jaw.record_outcome.side_effect = OSError("learning disk full")
+    await sm.start("s")
+    await sm.on_frame("s", _color(), _depth())
+    sm.freeze_attempt("s")
+    assert await sm.stop("s") == {"id": 42}
+    assert spring.uploads[0][-1] == 0.6
+    sm._three_jaw.discard_attempt.assert_called_once_with("s")
