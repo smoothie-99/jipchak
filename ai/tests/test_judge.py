@@ -8,6 +8,8 @@ def test_fallback_dummy_when_no_depth():
     result = judge.judge()
     assert result.is_caught is False
     assert result.method == "dummy"
+    assert result.outcome_status == "unknown"
+    assert result.is_valid is False
 
 
 def test_fallback_dummy_when_only_last_depth():
@@ -50,6 +52,8 @@ def test_not_caught_when_depth_same():
     )
     assert result.is_caught is False
     assert result.method == "depth_diff"
+    assert result.outcome_status == "failure"
+    assert result.is_valid is True
 
 
 def test_not_caught_when_change_too_small():
@@ -66,3 +70,16 @@ def test_not_caught_when_change_too_small():
         first_depth_frame=first,
     )
     assert result.is_caught is False
+
+
+def test_missing_valid_pixels_is_unknown_instead_of_training_failure():
+    result = CatchJudge().judge(depth_frame=np.zeros((60, 80)),
+                                first_depth_frame=np.zeros((60, 80)))
+    assert result.outcome_status == "unknown"
+    assert result.reason == "insufficient_valid_depth"
+
+
+def test_nonfinite_depth_cannot_produce_a_valid_label():
+    result = CatchJudge().judge(depth_frame=np.full((60, 80), np.nan),
+                                first_depth_frame=np.full((60, 80), np.inf))
+    assert result.outcome_status == "unknown"

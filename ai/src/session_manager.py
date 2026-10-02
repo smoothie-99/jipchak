@@ -1,5 +1,8 @@
 import asyncio
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
+from uuid import uuid4
 from typing import Dict, Optional
 
 import numpy as np
@@ -22,6 +25,10 @@ class GameSession:
     frame_count: int = 0
     started: bool = False
     last_success_probability: Optional[float] = None
+    attempt_id: str = field(default_factory=lambda: uuid4().hex)
+    last_frame_at: float = 0.0
+    grab_started: bool = False
+    observation_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
 class SessionManager:
@@ -74,8 +81,22 @@ class SessionManager:
                 self._three_jaw.discard_attempt(session_id)
 
         async with self._lock:
-            self._sessions[session_id] = GameSession(session_id=session_id)
+            session = GameSession(session_id=session_id)
+            self._sessions[session_id] = session
+            if self._three_jaw is not None:
+                self._three_jaw.begin_attempt(session_id, session.attempt_id)
         print(f"[SessionManager] session started: {session_id}")
+
+    def freeze_attempt(self, session_id: str) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        with session.observation_lock:
+            if session.grab_started:
+                return
+            session.grab_started = True
+            session.last_success_probability = (
+                self._three_jaw.freeze_attempt(session_id) if self._three_jaw else None)
 
     async def on_frame(
         self,
@@ -119,13 +140,14 @@ class SessionManager:
             session.frame_count += 1
 
         # 추론용 저장: D435 RGB (YOLO/GR-ConvNet 모두 이 프레임 사용)
-        if color_frame_infer is not None:
-            session.last_color_frame = color_frame_infer
-
-        if depth_frame is not None:
-            if session.first_depth_frame is None:
-                session.first_depth_frame = depth_frame.copy()
-            session.last_depth_frame = depth_frame
+        with session.observation_lock:
+            if color_frame_infer is not None:
+                session.last_color_frame = color_frame_infer
+                session.last_frame_at = time.monotonic()
+            if depth_frame is not None:
+                if session.first_depth_frame is None:
+                    session.first_depth_frame = depth_frame.copy()
+                session.last_depth_frame = depth_frame
 
     async def infer_grasp(self, session_id: str) -> Optional[dict]:
         """
@@ -141,17 +163,20 @@ class SessionManager:
         session = self._sessions.get(session_id)
         if session is None:
             return None
-        if session.last_color_frame is None:
-            return None
-
-        rgb = session.last_color_frame
-        depth = session.last_depth_frame
+        with session.observation_lock:
+            if session.last_color_frame is None or session.grab_started:
+                return None
+            rgb, depth, observed_at = session.last_color_frame, session.last_depth_frame, session.last_frame_at
 
         # 1. YOLO26s-seg ThreeJawGrasp (1순위)
         if self._three_jaw is not None:
-            pose = self._three_jaw.infer(rgb, depth, session_id=session_id)
+            pose = self._three_jaw.infer(rgb, depth, session_id=session_id,
+                                          observed_at=observed_at, attempt_id=session.attempt_id)
             if pose is not None:
-                session.last_success_probability = float(pose["confidence"])
+                with session.observation_lock:
+                    if session.grab_started or self._sessions.get(session_id) is not session:
+                        return None
+                    session.last_success_probability = float(pose["confidence"])
                 print(
                     f"[SessionManager] three_jaw: "
                     f"conf={pose['confidence']:.2f} "
@@ -237,6 +262,8 @@ class SessionManager:
 
         video_path = self._recorder.stop_session(session_id)
         if video_path is None:
+            if self._three_jaw is not None:
+                self._three_jaw.discard_attempt(session_id)
             print(f"[SessionManager] no video produced for {session_id}")
             return None
 
@@ -254,7 +281,15 @@ class SessionManager:
         # 마지막 추론 특징에 실제 결과를 라벨링한다. 데이터 조건이 충족되면
         # AutoSuccessLearner가 백그라운드에서 재학습하고 모델을 hot-reload한다.
         if self._three_jaw is not None:
-            self._three_jaw.record_outcome(session_id, result.is_caught)
+            try:
+                self._three_jaw.record_outcome(
+                    session_id, result.is_caught,
+                    outcome_valid=result.outcome_status != "unknown" and session.grab_started,
+                    outcome_metadata={"judge_method": result.method, "judge_reason": result.reason,
+                                      "outcome_status": result.outcome_status})
+            except Exception as exc:
+                self._three_jaw.discard_attempt(session_id)
+                print(f"[SessionManager] learning record failed: {exc}")
 
         # session_id 를 함께 전달 — Spring 이 Redis 키 (session:{id}) 로 저장하고
         # 모바일이 같은 id 로 영상 목록을 조회할 수 있게 한다.

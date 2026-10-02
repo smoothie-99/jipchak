@@ -1,5 +1,6 @@
 import math
 import threading
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
@@ -29,6 +30,17 @@ class GraspScoreMLP(nn.Module):
         return self.net(x)
 
 
+@dataclass(frozen=True)
+class PreparedModel:
+    model: nn.Module
+    norm_mean: Optional[np.ndarray]
+    norm_std: Optional[np.ndarray]
+    iso_x: Optional[np.ndarray]
+    iso_y: Optional[np.ndarray]
+    metadata: dict
+    sigmoid: Optional[tuple[float, float]] = None
+
+
 @EvaluatorFactory.register("default")
 class ThreeJawEvaluator:
     def __init__(
@@ -46,10 +58,11 @@ class ThreeJawEvaluator:
         self._norm_mean: Optional[np.ndarray] = None
         self._norm_std: Optional[np.ndarray] = None
         # Isotonic regression calibration mapping (sigmoid 출력 -> 진짜 확률)
-        # 학습 시 train split 으로 fit, .pth 에 함께 저장됨. 없으면 calibration 없이 raw sigmoid 사용.
+        # 독립 calibration split으로 fit해 .pth에 저장. 없으면 raw sigmoid 사용.
         self._iso_x: Optional[np.ndarray] = None  # 정렬된 score boundary
         self._iso_y: Optional[np.ndarray] = None  # 각 boundary 의 평균 라벨 (단조)
         self._model_metadata: dict = {}
+        self._sigmoid = None
         self._model_lock = threading.RLock()
 
         if model_path:
@@ -61,49 +74,80 @@ class ThreeJawEvaluator:
 
     @property
     def model_metadata(self) -> dict:
-        return dict(self._model_metadata)
+        with self._model_lock:
+            return dict(self._model_metadata)
+
+    def snapshot_model(self) -> Optional[PreparedModel]:
+        with self._model_lock:
+            if self.model is None:
+                return None
+            return PreparedModel(self.model, self._norm_mean, self._norm_std,
+                                 self._iso_x, self._iso_y, dict(self._model_metadata),
+                                 self._sigmoid)
+
+    def prepare_model(self, model_path: str) -> PreparedModel:
+        """Validate a candidate without changing serving state."""
+        ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
+        model = GraspScoreMLP(self.extractor.FEATURE_DIM)
+        mean = std = iso_x = iso_y = sigmoid = None
+        metadata = {}
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            if int(ckpt.get("feature_dim", self.extractor.FEATURE_DIM)) != self.extractor.FEATURE_DIM:
+                raise ValueError("feature_dim mismatch")
+            model.load_state_dict(ckpt["state_dict"])
+            if ("norm_mean" in ckpt) != ("norm_std" in ckpt):
+                raise ValueError("incomplete normalization")
+            if "norm_mean" in ckpt:
+                mean = np.asarray(ckpt["norm_mean"], dtype=np.float32)
+                std = np.asarray(ckpt["norm_std"], dtype=np.float32)
+                if (mean.shape != (self.extractor.FEATURE_DIM,) or std.shape != mean.shape
+                        or not np.isfinite(mean).all() or not np.isfinite(std).all()
+                        or (std <= 0).any()):
+                    raise ValueError("invalid normalization")
+            if ("iso_x" in ckpt) != ("iso_y" in ckpt):
+                raise ValueError("incomplete isotonic calibration")
+            if "iso_x" in ckpt:
+                iso_x = np.asarray(ckpt["iso_x"], dtype=np.float64)
+                iso_y = np.asarray(ckpt["iso_y"], dtype=np.float64)
+                if (iso_x.ndim != 1 or iso_x.size == 0 or iso_x.shape != iso_y.shape
+                        or not np.isfinite(iso_x).all() or not np.isfinite(iso_y).all()
+                        or (np.diff(iso_x) < 0).any() or (np.diff(iso_y) < 0).any()
+                        or ((iso_x < 0) | (iso_x > 1)).any()
+                        or ((iso_y < 0) | (iso_y > 1)).any()):
+                    raise ValueError("invalid isotonic calibration")
+            if "sigmoid" in ckpt:
+                sigmoid = tuple(float(v) for v in ckpt["sigmoid"])
+                if len(sigmoid) != 2 or not np.isfinite(sigmoid).all() or sigmoid[0] <= 0 or iso_x is not None:
+                    raise ValueError("invalid sigmoid calibration")
+            metadata = dict(ckpt.get("metadata", {}))
+        else:
+            model.load_state_dict(ckpt)
+        if not all(torch.isfinite(v).all() for v in model.state_dict().values()):
+            raise ValueError("nonfinite model weights")
+        model.eval()
+        prepared = PreparedModel(model, mean, std, iso_x, iso_y, metadata, sigmoid)
+        self.predict_features(np.zeros((2, self.extractor.FEATURE_DIM)), prepared)
+        return prepared
+
+    def activate_model(self, prepared: Optional[PreparedModel]) -> None:
+        """Switch all serving weights and preprocessing in one critical section."""
+        with self._model_lock:
+            self.model = prepared.model if prepared else None
+            self._norm_mean = prepared.norm_mean if prepared else None
+            self._norm_std = prepared.norm_std if prepared else None
+            self._iso_x = prepared.iso_x if prepared else None
+            self._iso_y = prepared.iso_y if prepared else None
+            self._model_metadata = dict(prepared.metadata) if prepared else {}
+            self._sigmoid = prepared.sigmoid if prepared else None
 
     def load_model(self, model_path: str) -> bool:
         """새 체크포인트를 완전히 검증한 뒤 추론 모델을 원자적으로 교체한다."""
         try:
-            ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-            model = GraspScoreMLP(self.extractor.FEATURE_DIM)
-            norm_mean = None
-            norm_std = None
-            iso_x = None
-            iso_y = None
-            metadata = {}
-
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                feature_dim = int(ckpt.get("feature_dim", self.extractor.FEATURE_DIM))
-                if feature_dim != self.extractor.FEATURE_DIM:
-                    raise ValueError(
-                        f"feature_dim mismatch: model={feature_dim}, "
-                        f"runtime={self.extractor.FEATURE_DIM}"
-                    )
-                model.load_state_dict(ckpt["state_dict"])
-                if "norm_mean" in ckpt and "norm_std" in ckpt:
-                    norm_mean = np.asarray(ckpt["norm_mean"], dtype=np.float32)
-                    norm_std = np.asarray(ckpt["norm_std"], dtype=np.float32)
-                if "iso_x" in ckpt and "iso_y" in ckpt:
-                    iso_x = np.asarray(ckpt["iso_x"], dtype=np.float64)
-                    iso_y = np.asarray(ckpt["iso_y"], dtype=np.float64)
-                metadata = dict(ckpt.get("metadata", {}))
-            else:
-                model.load_state_dict(ckpt)
-
-            model.eval()
-            with self._model_lock:
-                self.model = model
-                self._norm_mean = norm_mean
-                self._norm_std = norm_std
-                self._iso_x = iso_x
-                self._iso_y = iso_y
-                self._model_metadata = metadata
-
+            prepared = self.prepare_model(model_path)
+            self.activate_model(prepared)
             print(
                 f"[ThreeJawEvaluator] ML model loaded "
-                f"(dim={self.extractor.FEATURE_DIM}, samples={metadata.get('sample_count', '?')})"
+                f"(dim={self.extractor.FEATURE_DIM}, samples={prepared.metadata.get('sample_count', '?')})"
             )
             return True
         except Exception as exc:
@@ -135,9 +179,16 @@ class ThreeJawEvaluator:
         self, candidate: GraspCandidate, depth: Optional[np.ndarray] = None
     ) -> float:
         """학습 모델이 있으면 보정된 확률, 없으면 규칙 기반 초기 점수를 반환한다."""
-        if self.model is not None:
-            return float(self._mlp_scores([candidate], depth)[0])
-        return float(self._calculate_rule_score(candidate, depth))
+        return self.predict_with_source(candidate, depth)[0]
+
+    def predict_with_source(self, candidate: GraspCandidate, depth: Optional[np.ndarray] = None) -> tuple[float, str, str]:
+        """Keep the probability, source and version consistent across a hot-reload."""
+        prepared = self.snapshot_model()
+        if prepared is None:
+            return float(self._calculate_rule_score(candidate, depth)), "rule", "rule"
+        features = self.extractor.extract(candidate, depth).reshape(1, -1)
+        probability = float(self.predict_features(features, prepared)[0])
+        return probability, "ml", str(prepared.metadata.get("model_version", "legacy"))
 
     def _width_fitness(self, g: GraspCandidate) -> float:
         spec = self.config["gripper"]
@@ -234,34 +285,45 @@ class ThreeJawEvaluator:
         self, candidates: List[GraspCandidate], depth: Optional[np.ndarray]
     ) -> np.ndarray:
         features = self.extractor.extract_batch(candidates, depth)
-        with self._model_lock:
-            model = self.model
-            norm_mean = self._norm_mean
-            norm_std = self._norm_std
-            iso_x = self._iso_x
-            iso_y = self._iso_y
-        if model is None:
+        prepared = self.snapshot_model()
+        if prepared is None:
             return np.asarray(
                 [self._calculate_rule_score(c, depth) for c in candidates],
                 dtype=np.float32,
             )
-        # 학습 시 적용한 정규화를 동일하게 적용 (없으면 raw 사용 — 단 학습/추론 불일치 위험)
-        if norm_mean is not None and norm_std is not None:
-            features = (features - norm_mean) / norm_std
+        return self.predict_features(features, prepared)
+
+    def predict_features(self, features: np.ndarray, prepared: Optional[PreparedModel] = None) -> np.ndarray:
+        """Replay stored features with this model's own normalization and calibration."""
+        prepared = prepared or self.snapshot_model()
+        if prepared is None:
+            raise ValueError("no ML model available")
+        features = np.asarray(features, dtype=np.float32)
+        if features.ndim != 2 or features.shape[1] != self.extractor.FEATURE_DIM or not np.isfinite(features).all():
+            raise ValueError("invalid feature matrix")
+        if prepared.norm_mean is not None:
+            features = (features - prepared.norm_mean) / prepared.norm_std
+        if not np.isfinite(features).all():
+            raise ValueError("normalization produced nonfinite features")
         with torch.no_grad():
             tensor = torch.from_numpy(features.astype(np.float32))
-            scores = model(tensor).squeeze().numpy()
+            scores = prepared.model(tensor).reshape(-1).numpy()
 
         scores = np.atleast_1d(scores)
 
         # Isotonic calibration: sigmoid 출력 -> 진짜 확률
         # mapping 이 있으면 raw sigmoid 점수를 학습 시 fit 된 보정 곡선으로 변환.
-        if iso_x is not None and iso_y is not None:
-            scores = np.interp(scores, iso_x, iso_y)
+        if prepared.iso_x is not None:
+            scores = np.interp(scores, prepared.iso_x, prepared.iso_y)
+        elif prepared.sigmoid is not None:
+            p = np.clip(scores.astype(np.float64), 1e-7, 1-1e-7)
+            logits = prepared.sigmoid[0] * np.log(p/(1-p)) + prepared.sigmoid[1]
+            scores = 1 / (1 + np.exp(-np.clip(logits, -60, 60)))
 
         # 보정된 ML 출력은 실제 성공률을 직접 나타낸다. 여기서 규칙 기반
         # multiplier를 다시 곱하면 calibration이 깨지므로 후처리 가중치는 적용하지 않는다.
-        scores = np.clip(scores, 0.0, 1.0)
+        if not np.isfinite(scores).all() or ((scores < 0) | (scores > 1)).any():
+            raise ValueError("invalid model predictions")
         return scores
 
     def _load_config(self, path: Optional[str]) -> dict:

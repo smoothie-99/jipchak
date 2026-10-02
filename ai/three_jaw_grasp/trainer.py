@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .evaluator import GraspScoreMLP
 from .feature_extractor import FeatureExtractor
+from .dataset import load_attempts
 
 
 class GraspDataset(Dataset):
@@ -34,14 +34,9 @@ class GraspDataset(Dataset):
         cls, data_path: str, feature_dim: int = FeatureExtractor.FEATURE_DIM
     ) -> "GraspDataset":
         samples: list[dict] = []
-        with open(data_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                log = json.loads(line)
-                if len(log.get('features', [])) == feature_dim:
-                    samples.append({
-                        "features": np.asarray(log['features'], dtype=np.float32),
-                        "label": float(log['success']),
-                    })
+        for log in load_attempts(data_path, feature_dim):
+            if log["dataset_role"] == "train":
+                samples.append({"features": log["features"], "label": float(log["success"])})
         return cls(samples)
 
     def __len__(self):
@@ -69,6 +64,9 @@ def _split_samples(
     for label in (0, 1):
         class_idx = np.flatnonzero(labels == label)
         class_idx = rng.permutation(class_idx)
+        if len(class_idx) < 2:
+            train_idx.extend(class_idx.tolist())
+            continue
         n_val = min(
             len(class_idx) - 1,
             max(1, int(round(len(class_idx) * val_ratio))),
@@ -88,37 +86,56 @@ def _fit_isotonic(
     추론 시 np.interp(raw_sigmoid, iso_x, iso_y) 로 보정 점수 얻음.
 
     sigmoid 출력은 ranking 신호일 뿐 실제 성공률과 어긋남.
-    val split 에서 (predicted, actual) 쌍을 가지고 PAV 로 단조 보정.
+    별도 calibration split의 (predicted, actual) 쌍으로 단조 보정.
     """
     if len(scores) == 0:
         # 빈 입력 — identity mapping
         return np.array([0.0, 1.0]), np.array([0.0, 1.0])
 
-    order = np.argsort(scores)
-    s = scores[order]
-    y = labels[order].astype(np.float64)
-
-    sums = list(y)
-    sizes = [1] * len(y)
+    s, inverse, counts = np.unique(scores, return_inverse=True, return_counts=True)
+    sums = np.bincount(inverse, weights=labels.astype(np.float64)).tolist()
+    sizes = counts.tolist()
+    block_lengths = [1] * len(s)
     i = 0
     while i < len(sums) - 1:
         if sums[i] / sizes[i] > sums[i + 1] / sizes[i + 1]:
             sums[i] += sums[i + 1]
             sizes[i] += sizes[i + 1]
+            block_lengths[i] += block_lengths[i + 1]
             del sums[i + 1]
             del sizes[i + 1]
+            del block_lengths[i + 1]
             if i > 0:
                 i -= 1
         else:
             i += 1
 
-    fitted = np.empty_like(y)
+    fitted = np.empty_like(s)
     pos = 0
-    for s_sum, s_size in zip(sums, sizes):
+    for s_sum, s_size, length in zip(sums, sizes, block_lengths):
         avg = s_sum / s_size
-        fitted[pos:pos + s_size] = avg
-        pos += s_size
+        fitted[pos:pos + length] = avg
+        pos += length
     return s, fitted
+
+
+def _fit_sigmoid(scores: np.ndarray, labels: np.ndarray) -> list[float]:
+    logits = torch.tensor(np.log(np.clip(scores, 1e-7, 1-1e-7) /
+                                  (1-np.clip(scores, 1e-7, 1-1e-7))), dtype=torch.float64)
+    targets = torch.tensor(labels, dtype=torch.float64)
+    parameters = torch.zeros(2, dtype=torch.float64, requires_grad=True)
+    optimizer = optim.LBFGS([parameters], max_iter=50, line_search_fn="strong_wolfe")
+
+    def closure():
+        optimizer.zero_grad()
+        a = parameters[0].clamp(-10, 10).exp()
+        loss = nn.functional.binary_cross_entropy_with_logits(a * logits + parameters[1], targets)
+        loss = loss + 1e-4 * parameters.square().sum()
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return [float(parameters[0].detach().clamp(-10, 10).exp()), float(parameters[1].detach())]
 
 
 def train_evaluator_model(
@@ -132,6 +149,8 @@ def train_evaluator_model(
     seed: int = 0,
     feature_dim: int = FeatureExtractor.FEATURE_DIM,
     metadata: Optional[dict] = None,
+    min_calibration_samples: int = 100,
+    isotonic_min_samples: int = 1000,
 ):
     """
     데이터셋으로 GraspScoreMLP 모델을 학습하고 저장한다.
@@ -162,6 +181,13 @@ def train_evaluator_model(
         raise ValueError("성공과 실패 데이터가 모두 있어야 학습할 수 있습니다.")
 
     train_samples, val_samples = _split_samples(full.samples, val_ratio, seed)
+    if not val_samples:
+        raise ValueError("validation requires sufficient samples in both classes")
+    # Calibration must not fit on the same labels used to choose the best epoch.
+    calibration_samples = []
+    if (len(val_samples) >= 2 * min_calibration_samples
+            and min(sum(s["label"] == label for s in val_samples) for label in (0, 1)) >= 4):
+        val_samples, calibration_samples = _split_samples(val_samples, 0.5, seed + 1)
 
     # 정규화 통계는 train split 만 사용 (data leakage 방지)
     train_features = np.stack([s["features"] for s in train_samples])
@@ -239,27 +265,32 @@ def train_evaluator_model(
     if best_state is None:
         raise RuntimeError("학습 실패: best state 없음")
 
-    # Isotonic calibration: best 모델로 val split 추론 → 출력을 진짜 확률에 매핑
-    # PAV 알고리즘으로 단조 증가 step function 학습. (sigmoid 출력은 ranking 신호일 뿐
-    # 실제 확률과 어긋남 — 합성 데이터 검증에서 ECE 0.27 -> 0.02 로 감소함)
+    # Fit an independent calibrator only when enough samples are available.
     best_model = GraspScoreMLP(input_dim=feature_dim)
     best_model.load_state_dict(best_state)
     best_model.eval()
     val_scores: list[float] = []
     val_targets: list[float] = []
     with torch.no_grad():
-        for x, y in val_loader:
+        calibration_loader = DataLoader(GraspDataset(calibration_samples, mean=mean, std=std),
+                                        batch_size=batch_size)
+        for x, y in calibration_loader:
             out = best_model(x).squeeze(-1).numpy()
             val_scores.extend(np.atleast_1d(out).tolist())
             val_targets.extend(y.squeeze(-1).numpy().tolist())
-    iso_x, iso_y = _fit_isotonic(
-        np.asarray(val_scores, dtype=np.float64),
-        np.asarray(val_targets, dtype=np.float64),
-    )
-    print(
-        f"[trainer] isotonic calibration fit on val "
-        f"({len(val_scores)} samples → {len(iso_x)} unique boundaries)"
-    )
+    calibration = {}
+    method = "none"
+    if (len(val_scores) >= min_calibration_samples
+            and min(val_targets.count(label) for label in (0.0, 1.0)) >= 5):
+        scores = np.asarray(val_scores, dtype=np.float64)
+        targets = np.asarray(val_targets, dtype=np.float64)
+        if len(val_scores) >= isotonic_min_samples:
+            iso_x, iso_y = _fit_isotonic(scores, targets)
+            calibration = {"iso_x": iso_x.tolist(), "iso_y": iso_y.tolist()}
+            method = "isotonic"
+        else:
+            calibration = {"sigmoid": _fit_sigmoid(scores, targets)}
+            method = "sigmoid"
 
     output_path = Path(save_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,9 +302,9 @@ def train_evaluator_model(
             "best_epoch": best_epoch,
             "best_val_loss": float(best_val_loss),
             "best_val_acc": float(best_val_acc),
-            "iso_x": iso_x.tolist(),
-            "iso_y": iso_y.tolist(),
-            "metadata": metadata or {},
+            **calibration,
+            "metadata": {**(metadata or {}), "calibration_method": method,
+                         "calibration_samples": len(calibration_samples)},
         }
     torch.save(checkpoint, output_path)
     print(
